@@ -21,6 +21,9 @@ from pabla.analysis import aggregate, figures
 
 
 def main() -> int:
+    if '--v2' in sys.argv[1:]:
+        from pabla.v2.runner import main as v2_main
+        return v2_main([arg for arg in sys.argv[1:] if arg != '--v2'])
     parser=argparse.ArgumentParser(description='PABLA research workflow')
     parser.add_argument('--output',default='output')
     parser.add_argument('--backend',choices=['memory','anvil','auto'],default='auto')

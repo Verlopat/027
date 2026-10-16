@@ -175,3 +175,33 @@ The FI contract no longer allocates a per-batch `fiAnchors` schedule-root slot;
 period equals batch number and the schedule root is reconstructed from the
 registered schedule. EVM gas savings require independent before/after receipts
 and are not claimed without execution.
+
+## PABLA-v2 reference implementation (research branch)
+
+The opt-in v2 code lives in `pabla/v2/`; the existing PABLA-FI entry point
+is retained unchanged for backwards-compatible comparison.
+
+```bash
+python3 Main.py --v2 --events 32
+python3 -m pytest -q tests/v2
+```
+
+Each execution creates `output/v2testN/` containing a report, environment
+manifest, a persisted collector store, an independent witness store, and
+`x03_windows.csv`. The X3 probes actually forge evidence, call the independent
+full verifier, and compare outcomes with a separate analytic window model.
+All v2 runs identify the **in-memory test double**; the example uses synthetic
+data and does not report EVM gas, public-chain finality, published-baseline
+performance, or verified novelty. The offline scheduler accepts an optional
+`--gas-csv <path>` with a `price` column; external data receive a SHA-256 digest.
+
+See `docs/protocol-v2.md`, `docs/windows-v2.md`, and `docs/v2-validation.md`.
+`contracts/src/AnchorLogV2.sol` implements a distinct secp256k1-signed checkpoint
+and equivocation-proof contract, rather than adding Ed25519 assertions to the
+legacy contract. The existing v1 and FI baseline implementations remain.
+
+**Security limitation:** SQLite and the CPython reference backend do not provide
+forensic-grade key erasure. They must not be represented as satisfying A-ERASE
+under an attacker who obtains disk images, page caches or process-memory copies.
+The pure-Python secp256k1 implementation is neither constant-time nor side-channel
+hardened. Do not deploy it for production key custody.
