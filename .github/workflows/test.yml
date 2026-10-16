@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv run --extra test pytest -q
+      - run: uv run --locked --extra test pytest -q
   foundry-and-anvil:
     runs-on: ubuntu-latest
     steps:
@@ -35,7 +35,7 @@ jobs:
                 http://127.0.0.1:8545 | grep -q '0x7a69'
       - name: Live contract and E1-E7 integration
         run: |
-          uv sync --extra chain --extra test
+          uv sync --locked --extra chain --extra test
           uv run python scripts/deploy_contract.py
           export PABLA_CONTRACT=$(python -c 'import json;print(json.load(open("contract-deployment.json"))["address"])')
           uv run python Main.py --backend anvil --require-chain --trials 1 --events 12 --batch-size 6
