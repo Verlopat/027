@@ -24,7 +24,7 @@ from .storage import RunIndex, archive_size, manifest_metadata, save_batch, writ
 from .workloads import attack_batch, adaptive_attack_batch, generate_events
 
 METHODS = ('P1','B1','B2','B3','B4','A1','A2','A3','A4','A5')
-ATTACKS = ('AT1','AT2','AT3','AT4','AT5','AT6','AT7','AT8','AT9','AT10')
+ATTACKS = ('AT1','AT2','AT3','AT4','AT5','AT6','AT7','AT8','AT9','AT10', 'TAIL_TRUNCATION', 'MIDDLE_BATCH_DELETE', 'BATCH_REORDER', 'CROSS_BATCH_SPLICE', 'FORK')
 
 
 @dataclass
@@ -41,6 +41,24 @@ class Options:
     base_timestamp: str = ''
 
 
+_ANVIL_SNAPSHOT: dict[str, Any] = {}
+
+def init_chain_snapshot(options: Options) -> None:
+    """Take a stable post-deployment (and post-smoke) Anvil state snapshot.
+
+    Snapshot/revert is an experimental reset, not Ethereum transaction finality.
+    """
+    global _ANVIL_SNAPSHOT
+    if options.backend != 'anvil':
+        _ANVIL_SNAPSHOT = {}
+        return
+    from .ledger import AnvilLedger
+    chain = AnvilLedger(options.rpc, options.contract_address, options.abi_path)
+    response=chain.web3.provider.make_request('evm_snapshot',[])
+    if 'result' not in response:
+        raise ProtocolError(f'Anvil snapshot failed: {response}')
+    _ANVIL_SNAPSHOT={'id':response['result'],'rpc':options.rpc,'contract':options.contract_address}
+
 def ledger_for(options: Options):
     if options.backend == 'memory':
         return InMemoryLedger()
@@ -48,7 +66,18 @@ def ledger_for(options: Options):
         if not options.contract_address:
             raise ProtocolError('anvil requires deployed contract address')
         from .ledger import AnvilLedger
-        return AnvilLedger(options.rpc, options.contract_address, options.abi_path)
+        ledger=AnvilLedger(options.rpc, options.contract_address, options.abi_path)
+        if _ANVIL_SNAPSHOT:
+            if (_ANVIL_SNAPSHOT['rpc'],_ANVIL_SNAPSHOT['contract']) != (options.rpc,options.contract_address):
+                raise ProtocolError('Anvil snapshot belongs to a different deployment')
+            reverted=ledger.web3.provider.make_request('evm_revert',[_ANVIL_SNAPSHOT['id']])
+            if reverted.get('result') is not True:
+                raise ProtocolError(f'Anvil snapshot revert failed: {reverted}')
+            new=ledger.web3.provider.make_request('evm_snapshot',[])
+            if not new.get('result'):
+                raise ProtocolError(f'Anvil re-snapshot failed: {new}')
+            _ANVIL_SNAPSHOT['id']=new['result']
+        return ledger
     raise ValueError('unsupported ledger backend')
 
 
@@ -161,6 +190,39 @@ def continuity(options: Options) -> list[dict]:
                         v = verify_batch(changed,l,policy=c.policy)
                 rows.append(_row('E2',method,trial,l,attack=attack,attacker_model='naive',verdict=v.status,
                                  anomalies=';'.join(v.anomalies),detected=int(_record_status(v)),valid_case=False))
+            if len(bs)>2 and method != 'B1':
+                for history_attack in ('MIDDLE_BATCH_DELETE','BATCH_REORDER','CROSS_BATCH_SPLICE','FORK'):
+                    history=copy.deepcopy(bs)
+                    if history_attack=='MIDDLE_BATCH_DELETE':
+                        history.pop(1)
+                    elif history_attack=='BATCH_REORDER':
+                        history[1],history[2]=history[2],history[1]
+                    elif history_attack=='CROSS_BATCH_SPLICE':
+                        history[1].events[-1],history[2].events[0]=history[2].events[0],history[1].events[-1]
+                    else:
+                        forged=history[1]
+                        forged.events[0]['payload']['pid']+=1
+                        # Key compromise can re-sign, but the first legitimate
+                        # fork is already anchored. A second fork must mismatch.
+                        from .protocol import chain_hash,event_hash,leaf_hash,merkle_root
+                        prev=forged.manifest['first_previous_chain'] if c.policy.chain else '00'*32
+                        leaves=[]
+                        for j,ev in enumerate(forged.events):
+                            seq=forged.manifest['first_sequence']+j
+                            h=event_hash(c.collector_id,c.epoch,seq,ev)
+                            prev=chain_hash(c.collector_id,c.epoch,seq,prev,h) if c.policy.chain else '00'*32
+                            leaves.append(leaf_hash(seq,h,prev))
+                        forged.manifest['last_chain']=prev
+                        forged.manifest['merkle_root']=merkle_root(leaves)
+                        forged.manifest_digest=manifest_hash(forged.manifest)
+                        forged.signature=sign(c.private_key,forged.manifest_digest) if c.policy.sign_batches else ''
+                    findings=verify_complete_history(history,l,policy=c.policy,collector_id=c.collector_id,epoch=c.epoch)
+                    detected=any(_record_status(z) for z in findings)
+                    v=next((z for z in findings if _record_status(z)),findings[-1])
+                    rows.append(_row('E2',method,trial,l,attack=history_attack,
+                                     attacker_model='history-attack' if history_attack!='FORK' else 'authorized-key-fork',
+                                     verdict=v.status,anomalies=';'.join(v.anomalies),
+                                     detected=int(detected),valid_case=False))
             honest = verify_history(bs,l,c.policy)
             # Tail truncation must be assessed against the *trusted ledger tip*.
             if method in ('P1','B1','B4','A1','A2') and len(bs)>1:
@@ -189,10 +251,13 @@ def overhead(options: Options) -> list[dict]:
                 transactions=len(receipts),tx_per_event=len(receipts)/count,
                 evm_gas_used=sum(r.get('gas_used',0) for r in receipts) if evm else None,
                 evm_input_bytes=sum(r.get('transaction_input_bytes',0) for r in receipts) if evm else None,
+                receipt_tx_hashes=json.dumps([r.get('tx_hash') for r in receipts]),
+                receipt_block_numbers=json.dumps([r.get('block_number') for r in receipts]),
+                receipt_gas_per_tx=json.dumps([r.get('gas_used') for r in receipts]) if evm else None,
                 build_ns_per_event=build_ns/count,anchor_ns_per_event=l.measurement_anchor_ns/count,verify_ns_per_event=verify_ns/count,
                 encoded_artifact_bytes=sum(len(json.dumps(b.export())) for b in bs),
-                method_order=methods.index(method), chain_reset_before_method=False,
-                measurement_type='measured-anvil-shared-state' if evm else 'measured-nonchain-test-double'))
+                method_order=methods.index(method), chain_reset_before_method=bool(_ANVIL_SNAPSHOT) if evm else True,
+                measurement_type='measured-anvil-snapshot-reset' if evm and _ANVIL_SNAPSHOT else ('measured-anvil-shared-state' if evm else 'measured-nonchain-test-double')))
     return rows
 
 
@@ -252,7 +317,7 @@ def tradeoff(options: Options) -> list[dict]:
                         measured_e2e_anchor_delay_median_ms=statistics.median(delays),
                         measured_e2e_anchor_delay_p95_ms=delays[min(count-1,int(.95*(count-1)))],
                         transactions=len(receipts),physical_pacing=True,chain_latency_measured=ledger.backend=='anvil-evm',
-                        chain_reset_before_method=False,method_order=methods.index(method)))
+                        chain_reset_before_method=bool(_ANVIL_SNAPSHOT) if options.backend=='anvil' else True,method_order=methods.index(method)))
     return rows
 
 
@@ -315,6 +380,16 @@ def residual(options: Options) -> list[dict]:
         rows.append(_row('E6','P1',trial,l2,attack='AT5',scenario='valid-signature-implausible-clock',
                          verdict=skew_verdict.status,cryptographic_accept=int(skew_verdict.status=='ACCEPT'),
                          ground_truth='signed wall-clock skew'))
+        l3,c3,old3,_,_,_= _make(options,'A5',options.seed+trial+3,options.batch_size,options.batch_size)
+        skew_events=generate_events(options.batch_size,options.seed+trial+4,c3.collector_id,c3.epoch)
+        for i,ev in enumerate(skew_events):
+            ev['collector_monotonic_ns']=options.batch_size+i+1
+        skewed=c3.collect(skew_events,wall_time='2001-01-01T00:00:00.000Z')
+        l3.anchor(skewed)
+        a5=verify_batch(skewed,l3,policy=c3.policy,previous=old3[-1].manifest)
+        rows.append(_row('E6','A5',trial,l3,attack='AT5',scenario='timestamp-validation-ablated',
+                         verdict=a5.status,cryptographic_accept=int(a5.status=='ACCEPT'),
+                         ground_truth='signed clock skew under disabled timestamp check'))
     return rows
 
 
@@ -337,6 +412,79 @@ def stability(options: Options) -> list[dict]:
             rows.append(_row('E7',method,trial,type('Backend',(),{'backend': 'anvil-evm' if options.backend=='anvil' else 'in-memory-test-only'})(),
                              **measurements,measurement_type='isolated-process'))
     return rows
+
+
+def ct_history_comparison(options: Options) -> list[dict]:
+    """E8: cross-check signed RFC 6962-style append-only consistency evidence.
+
+    Uses identical canonical event bytes for both methods. CT history-tree
+    implementation is a transparent *reference*, not optimized service code.
+    Runtime data are reported but are not used to assert production speedups.
+    """
+    import copy
+    from .ct_baseline import CTBaseline, leaf as ct_leaf, root as ct_root, inclusion_proof, verify_inclusion, consistency_proof, verify_consistency
+    from .protocol import canonical
+    rows=[]
+    for trial in range(options.trials):
+        count=min(options.event_count, 1000)
+        l,c,bs,receipt,build_ns,verify_ns = _make(options,'P1', options.seed+trial,count,
+                                                    min(options.batch_size,count))
+        events=[ev for b in bs for ev in b.events]
+        correct=verify_complete_history(bs,l,policy=c.policy,collector_id=c.collector_id,epoch=c.epoch)
+        rows.append(_row('E8','P1',trial,l,events=count,
+                         all_valid=int(all(v.status=='ACCEPT' for v in correct)),
+                         verification_ns=verify_ns,construction_ns=build_ns,
+                         trust_model='registered collector and ledger anchored batches',
+                         input_fingerprint=digest_events(events)))
+        ct=CTBaseline(c.private_key)
+        tb=time.perf_counter_ns()
+        old=None; comparisons=[]; last_checkpoint=None
+        for offset in range(0,len(events),min(options.batch_size,count)):
+            subset=events[offset:offset+min(options.batch_size,count)]
+            for event in subset:
+                ct.append(event)
+            current=ct.checkpoint()
+            if old:
+                proof=consistency_proof(ct.hashes,old['size'])
+                comparisons.append((old,current,proof))
+            old=current
+            last_checkpoint=current
+        constructed_ns=time.perf_counter_ns()-tb
+        tv=time.perf_counter_ns()
+        all_valid=ct.verify_checkpoint(last_checkpoint,ct.public_key)
+        all_valid=all_valid and all(
+            ct.verify_checkpoint(old,ct.public_key) and
+            verify_consistency(old['size'],now['size'],
+                               bytes.fromhex(old['root']),bytes.fromhex(now['root']),proof)
+            for old,now,proof in comparisons)
+        audit_index=len(events)//2
+        inclusion=inclusion_proof(ct.hashes,audit_index)
+        all_valid=all_valid and verify_inclusion(ct.hashes[audit_index],audit_index,len(ct.hashes),
+                                                 inclusion,bytes.fromhex(last_checkpoint['root']))
+        altered=copy.deepcopy(events[audit_index])
+        altered['payload']['pid']+=1
+        detects_tamper=not verify_inclusion(ct_leaf(canonical(altered)),audit_index,len(events),inclusion,
+                                           bytes.fromhex(last_checkpoint['root']))
+        verification_ns=time.perf_counter_ns()-tv
+        rows.append(_row('E8','CT_HISTORY_TREE_REFERENCE',trial,l,events=count,
+                         all_valid=int(all_valid),detects_postcommit_tamper=int(detects_tamper),
+                         consistency_comparisons=len(comparisons),
+                         proof_bytes=sum(len(p)*32 for _,_,pp in comparisons for p in [pp]),
+                         construction_ns=constructed_ns,verification_ns=verification_ns,
+                         trust_model='signed transparency-tree checkpoints, no ledger anchoring',
+                         input_fingerprint=digest_events(events),
+                         performance_claim='reference implementation, not optimized or production throughput'))
+    return rows
+
+def digest_events(events: list[dict]) -> str:
+    from .protocol import digest, canonical
+    import hashlib
+    h=hashlib.sha256()
+    for ev in events:
+        encoded=canonical(ev)
+        h.update(len(encoded).to_bytes(8,'big'))
+        h.update(encoded)
+    return h.hexdigest()
 
 
 def save_rows(run: Path, name: str, rows: list[dict]) -> None:
@@ -363,12 +511,19 @@ def run_all(run: Path, options: Options) -> dict[str, list[dict]]:
     config = vars(options).copy()
     if options.backend not in ('memory','anvil'):
         raise ValueError('unknown backend')
-    write_json(run/'environment.json',manifest_metadata(config,'anvil-evm' if options.backend=='anvil' else 'in-memory-test-only'))
+    environment=manifest_metadata(config,'anvil-evm' if options.backend=='anvil' else 'in-memory-test-only')
+    if options.backend=='anvil':
+        from .ledger import AnvilLedger
+        info=AnvilLedger(options.rpc,options.contract_address,options.abi_path)
+        environment['evm_client_version']=info.web3.client_version
+        environment['evm_chain_id']=int(info.web3.eth.chain_id)
+    write_json(run/'environment.json',environment)
+    init_chain_snapshot(options)
     suite={}
     for title,fn in (('e1_integrity',integrity),('e2_continuity',continuity),
                      ('e3_overhead',overhead),('e4_tradeoff',tradeoff),
                      ('e5_recovery',recovery),('e6_residual_risk',residual),
-                     ('e7_stability',stability)):
+                     ('e7_stability',stability),('e8_ct_history_comparison',ct_history_comparison)):
         t0=time.perf_counter_ns()
         try:
             rows=fn(options)

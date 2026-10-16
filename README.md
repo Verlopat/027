@@ -16,7 +16,7 @@ forge --version
 
 Recommended: Python 3.12/3.13, `uv`, Foundry/Anvil for genuine blockchain experiments. Use a dedicated venv, never `sudo pip`. No real Ethereum private keys or public networks are required.
 
-## Quick start (local cryptographic smoke test + E1–E7 experiment suite)
+## Quick start (local cryptographic smoke test + E1–E8 experiment suite)
 
 ```sh
 git clone https://github.com/Verlopat/027.git
@@ -60,7 +60,7 @@ Default is intentionally laptop-safe (pilot profile). The `full` profile increas
 - `pabla/ledger.py`: persistent-on-chain EVM registry adapter and independently labeled in-memory test ledger.
 - `contracts/`: Solidity registry, epoch revocation, monotonic anchor sequencing and contract tests.
 - `pabla/workloads.py`: deterministic synthetic telemetry and post-commitment attack injection.
-- `pabla/experiments.py`: experimental profiles, paired trial framework, E1–E7 raw observation generation.
+- `pabla/experiments.py`: experimental profiles, paired trial framework, E1–E8 raw observation generation.
 - `pabla/analysis.py`: exact binomial confidence intervals, paired McNemar and Holm-adjusted comparisons, bootstrap CIs, plots.
 - `pabla/storage.py`: per-run directories, atomic artifact writes and SQLite indexing.
 - `Main.py`: single-entrypoint workflow; no manuscript files are created.
@@ -101,3 +101,5 @@ The verifier now requires an explicit, registry-bound trusted policy. Manifest-p
 Security trial summaries distinguish adaptive attacks and do not attach pseudoreplicated significance tests to deterministic detection. Construction and anchor timings are separated. E7 uses isolated subprocesses for RSS/CPU measurements. GitHub Actions includes a pinned Foundry v1.5.0 job, Foundry contract tests and a minimal real-Anvil integration run. **Local development did not include a live Foundry/Anvil toolchain or an online dependency resolution**, so live-EVM results and a `uv.lock` file must be generated/validated in a networked environment.
 
 The implementation remains research software, not a production deployment or proof of scientific novelty. Unresolved journal requirements include independently reset EVM runs for unbiased comparison, a truly external evaluated baseline, stronger formal provenance claims, a frozen full experiment matrix, and independent audit. Internal ablations that fail to demonstrate unique detection capability must be reported as negative findings, not discarded.
+
+An E8 comparison evaluates signed Certificate Transparency-style binary history trees with independently verified inclusion and append-only consistency proofs. The code is a reference implementation for evidence semantics, not an optimized CT service; performance superiority over mature CT deployments is not claimed.

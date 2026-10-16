@@ -59,9 +59,18 @@ def save_batch(run: Path, batch: Batch, receipt: dict | None = None) -> Path:
 
 
 def manifest_metadata(config: dict, backend: str) -> dict:
+    model = platform.processor()
+    cpuinfo = Path('/proc/cpuinfo')
+    if cpuinfo.is_file():
+        for entry in cpuinfo.read_text(errors='replace').splitlines():
+            if entry.startswith('model name') and ':' in entry:
+                model = entry.split(':', 1)[1].strip()
+                break
+    governor_path = Path('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor')
+    governor = governor_path.read_text().strip() if governor_path.is_file() else None
     return {'config':config, 'config_sha256':hashlib.sha256(canonical(config)).hexdigest(),
             'backend':backend, 'python':sys.version, 'os':platform.platform(),
-            'processor':platform.processor(), 'created_unix':time.time()}
+            'processor':model, 'governor':governor, 'created_unix':time.time()}
 
 
 class RunIndex:

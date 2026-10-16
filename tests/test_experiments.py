@@ -8,7 +8,7 @@ def test_experiments_local(tmp_path):
     (tmp_path / "results" / "derived").mkdir(parents=True)
     suite=run_all(tmp_path,o)
     derived=aggregate(suite,tmp_path)
-    assert len(suite)==7 and derived["detection"]
+    assert len(suite)==8 and derived["detection"]
     assert (tmp_path / "results" / "derived" / "summary.json").exists()
     assert integrity(o)
     assert continuity(o)
@@ -29,3 +29,12 @@ def test_stats():
     assert holm([.01,.02,.03])==[.03,.04,.04] or all(x>=y for x,y in zip(holm([.01,.02,.03]),[.01,.02,.03]))
     lo,hi=bootstrap_median_ci([1,2,3,4],repetitions=200)
     assert lo<=hi
+
+
+def test_ct_history_baseline_uses_paired_inputs():
+    from pabla.experiments import ct_history_comparison
+    rows=ct_history_comparison(Options(trials=1,event_count=12,batch_size=4))
+    assert len(rows)==2
+    assert rows[0]['input_fingerprint']==rows[1]['input_fingerprint']
+    assert rows[0]['all_valid']==rows[1]['all_valid']==1
+    assert rows[1]['detects_postcommit_tamper']==1
