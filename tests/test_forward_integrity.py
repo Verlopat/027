@@ -153,3 +153,94 @@ def test_lanl_stream_loader_sha256(tmp_path):
     assert checksum==hashlib.sha256(sample).hexdigest()
     r=fi_public_replay(Options(dataset_path=str(p),event_count=3,batch_size=2))
     assert all(x['status']=='EXECUTED' and x['source_sha256']==checksum for x in r)
+
+
+def test_anchor_race_adaptive_by_method_and_relay_custody():
+    from pabla.experiments.e9_fi import anchor_race_forged_pending
+    from pabla.experiments import Options
+    o=Options(trials=1,event_count=12,batch_size=4)
+    for method,valid in [('P1',1),('B4',1),('FI-noerase',1),('FI',0),('FI-nochain',0)]:
+        for delay in (0,20):
+            rows=anchor_race_forged_pending(o,method,0,delay)
+            assert len(rows)==2
+            forged,honest=rows
+            assert forged['attack']=='ANCHOR_RACE_FORGED_PENDING'
+            assert forged['copy']=='forged' and forged['accepted']==valid
+            assert honest['copy']=='honest-relay' and honest['accepted']==0
+            assert honest['availability_failure']==1
+            assert forged['relay_delivered_before_theft']==int(delay<=10)
+            if not valid:
+                assert forged['verdict']=='REJECT_AUTHORIZATION'
+
+
+def test_witness_relay_is_immutable_by_copy_and_detects_equivocation():
+    from pabla.relay import WitnessRelay
+    l,c,b=setup_fi()
+    r=WitnessRelay(delivery_delay_ms=30)
+    r.emit(b[0],emitted_ms=100)
+    assert r.held('fi-source',1,1) is None
+    assert r.deliver(129)==[]
+    assert len(r.deliver(130))==1
+    stored=r.held('fi-source',1,1)
+    stored.events[0]['payload']['pid']+=1
+    assert stored.events!=r.held('fi-source',1,1).events
+    modified=copy.deepcopy(b[0]);modified.events[0]['payload']['pid']+=5
+    modified.manifest_digest='ab'*32
+    r.emit(modified,emitted_ms=150)
+    r.deliver(180)
+    assert len(r.conflicts)==1
+
+
+def test_e10_measured_signing_and_suppression_are_distinct():
+    from pabla.experiments.e10_e12 import measured_compromise
+    from pabla.experiments import Options
+    o=Options(trials=1,event_count=48,batch_size=4)
+    fi=measured_compromise(o,method='FI',trial=0,bound_ms=50,relay_delay_ms=100)
+    static=measured_compromise(o,method='P1',trial=0,bound_ms=50,relay_delay_ms=100)
+    noerase=measured_compromise(o,method='FI-noerase',trial=0,bound_ms=50,relay_delay_ms=100)
+    assert fi['suppression_exposed_measured']>=fi['modification_exposed_measured']
+    assert fi['modification_exposed_measured']<static['modification_exposed_measured']
+    assert noerase['modification_exposed_measured']==static['modification_exposed_measured']
+    for row in (fi,static,noerase):
+        assert row['modification_exposed_measured']==row['modification_exposed_model']
+        assert row['suppression_exposed_measured']==row['suppression_exposed_model']
+
+
+def test_fi_contract_slot_optimization_in_source():
+    from pathlib import Path
+    source=Path('contracts/src/CollectorAnchorRegistry.sol').read_text()
+    assert 'struct FIAnchor' not in source
+    assert 'fiAnchors[collector][epoch][batchNumber] = scheduleRoot' not in source
+    assert 'function anchorFIWitness' in source
+    assert 'function registerFIWitness' in source
+
+
+def test_witness_protected_anchor_race_prevents_slot_denial():
+    from pabla.experiments.e9_fi import protected_anchor_race
+    o=Options(trials=1,event_count=12,batch_size=4)
+    for delay in (0,20,100):
+        rows=protected_anchor_race(o,0,delay)
+        forged,honest=rows
+        assert forged['accepted']==0
+        assert forged['verdict']=='REJECT_SUBMISSION'
+        assert forged['forged_anchor_committed']==0
+        assert honest['accepted']==1
+        assert honest['availability_failure']==0
+        assert rows[0]['relay_delivered_before_theft']==int(delay<=10)
+
+
+def test_attested_ledger_rejects_unwitnessed_or_wrong_signature():
+    from pabla.relay import WitnessRelay
+    ledger,collector,batches=setup_fi()
+    # This separate registration tests witness authorization explicitly.
+    witness=WitnessRelay()
+    other=InMemoryLedger()
+    other.register_fi('fi-source',1,collector.evolving.root,8,witness_public_key=witness.public_key)
+    with pytest.raises(ProtocolError,match='witness'):
+        other.anchor(batches[0])
+    with pytest.raises(ProtocolError,match='witness'):
+        other.anchor_attested(batches[0],witness_signature='00'*64)
+    witness.emit(batches[0],emitted_ms=5)
+    witness.deliver(5)
+    rec=witness.anchor_held('fi-source',1,1,ledger=other,policy=collector.policy,previous=None)
+    assert rec['manifest_hash']==batches[0].manifest_digest

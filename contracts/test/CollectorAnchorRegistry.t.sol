@@ -116,3 +116,38 @@ contract ForwardIntegrityRegistryTest {
         require(!revoked,"revoked FI epoch anchored");
     }
 }
+
+/// @notice A witness address independent of the compromised collector sender.
+/// Off-chain Ed25519 validation is the witness's responsibility, and the
+/// on-chain role prevents bypass with the collector's EVM submitter account.
+contract IndependentWitness {
+    function commit(CollectorAnchorRegistry r, bytes32 c, bytes32 root) external {
+        r.anchorFIWitness(c,1,1,bytes32(uint256(31)),bytes32(uint256(32)),
+                          bytes32(uint256(33)),1,3,bytes32(0),1,root);
+    }
+}
+
+contract WitnessProtectedAnchorTest {
+    function testCollectorCannotRaceProtectedFIAnchor() public {
+        CollectorAnchorRegistry r=new CollectorAnchorRegistry();
+        IndependentWitness witness=new IndependentWitness();
+        bytes32 c=keccak256("fi-independent-witness");
+        bytes32 root=keccak256("fi-schedule-root");
+        r.registerFIWitness(c,1,root,4,address(this),address(witness),bytes32(uint256(1)));
+        require(r.fiWitness(c,1)==address(witness),"wrong FI witness");
+        // Collector owns the normal submitter account but not witness.
+        (bool unprotectedOk,) = address(r).call(abi.encodeWithSelector(r.anchorFI.selector,
+            c,uint64(1),uint64(1),bytes32(uint256(31)),bytes32(uint256(32)),
+            bytes32(uint256(33)),uint64(1),uint64(3),bytes32(0),uint64(1),root));
+        require(!unprotectedOk,"legacy FI function bypassed witness");
+        (bool stolenCollectorOk,) = address(r).call(abi.encodeWithSelector(r.anchorFIWitness.selector,
+            c,uint64(1),uint64(1),bytes32(uint256(31)),bytes32(uint256(32)),
+            bytes32(uint256(33)),uint64(1),uint64(3),bytes32(0),uint64(1),root));
+        require(!stolenCollectorOk,"collector forged protected FI anchor");
+        require(r.latestBatch(c,1)==0,"forged commitment occupied slot");
+        witness.commit(r,c,root);
+        require(r.latestBatch(c,1)==1,"honest witness could not anchor");
+        (uint64 period,bytes32 schedule)=r.getFIAnchor(c,1,1);
+        require(period==1 && schedule==root,"FI schedule root lookup incorrect");
+    }
+}

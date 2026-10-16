@@ -127,3 +127,51 @@ explicit compromise limitations, proof assumptions, measurement provenance,
 models versus observations, the distinction between CT checkpoints and anchored
 CT roots, and known incomplete validations. Neither journal novelty nor
 production key erasure is established by a passing test suite.
+
+## Anchor-race, relay and dual exposure evaluation
+
+The `pabla/relay.py` witness retains signed batch copies only after a declared
+transfer delay. E9 adds `ANCHOR_RACE_FORGED_PENDING` for P1/B4/FI/FI-noerase,
+verifying both forged and honest-relay histories after the forged on-chain
+commitment. An FI forged signature is rejected, but the contract can still
+anchor invalid signed evidence from an authorized submitter, so the honest
+copy can be denied anchoring. See `docs/forward-integrity.md`.
+
+E10 now reports independently **modification** and **suppression** exposure,
+with fields comparing executed attacks/verifier outcomes to a separate custody
+model. E11 is a cost characterization, not an optimization claim. The hash
+chain is not a distinguishing novelty claim. Experiment code lives under
+`pabla/experiments/{common,e1_e8,e9_fi,e10_e12}.py`.
+
+To acquire an *official* LANL trace and run E12 when Internet access is
+available (small red-team file is for functional validation, not volume):
+
+```bash
+python scripts/download_lanl.py --subset redteam --output data/lanl-redteam.txt.gz
+uv run python Main.py --dataset-path data/lanl-redteam.txt.gz
+```
+
+A full-scale Anvil evaluation must be conducted separately with ten or more
+independently reset trials, its output directories and SHA-256 dataset manifest
+archived. The full grid and before/after FI gas savings have **not** been
+measured in the offline environment. Never infer gas savings from changed
+Solidity storage layout alone.
+
+## Witness-gated anchor race protection
+
+A separate `FI+WITNESS` E9 model registers an independently controlled witness
+address and a relay key. The compromised collector's normal EVM submitter
+cannot anchor unverified FI evidence. The relay must receive and verify the
+honest signed batch before its separately controlled witness account submits
+`anchorFIWitness`. A delayed or noncooperating witness still delays anchoring;
+this is *not* a trustless solution. The legacy FI path remains available for
+explicit comparison and is susceptible to anchor-slot denial.
+
+The relay is implemented in `pabla/relay.py`, and the protected E9 simulation
+and tests use real verifier outcomes. Anvil test accounts are local and unlocked;
+no production-grade key isolation or on-chain Ed25519 verification is implied.
+
+The FI contract no longer allocates a per-batch `fiAnchors` schedule-root slot;
+period equals batch number and the schedule root is reconstructed from the
+registered schedule. EVM gas savings require independent before/after receipts
+and are not claimed without execution.

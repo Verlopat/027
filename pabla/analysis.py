@@ -159,17 +159,50 @@ def figures(run: Path, summary: dict) -> list[str]:
         plt.close(fig)
     exposure=summary.get('fi_exposure',[])
     if exposure:
-        fig,ax=plt.subplots(figsize=(6,5))
-        ax.scatter([r['modelled_exposed_events'] for r in exposure],
-                   [r['observed_exposed_events'] for r in exposure])
-        maximum=max([r['modelled_exposed_events'] for r in exposure]+[1])
-        ax.plot([0,maximum],[0,maximum],linestyle='--')
-        ax.set_xlabel('Modelled exposed events')
-        ax.set_ylabel('Computed exposed events')
-        ax.set_title('E10 simulated exposure model validation')
+        fig,ax=plt.subplots(figsize=(7,5))
+        for method in sorted(set(r['method'] for r in exposure)):
+            sample=[r for r in exposure if r['method']==method]
+            ax.scatter([r['modification_exposed_model'] for r in sample],
+                       [r['modification_exposed_measured'] for r in sample],label=method)
+        mx=max([r['modification_exposed_model'] for r in exposure]+[1])
+        ax.plot([0,mx],[0,mx],linestyle='--')
+        ax.set_xlabel('Independent custody/key model: modifiable events')
+        ax.set_ylabel('Executed attacker/verifier: modifiable events')
+        ax.set_title('E10 measured modification exposure vs independent model')
+        ax.legend()
         fig.tight_layout()
         for ext in ('svg','pdf'):
             output=run/'figures'/f'F10_exposure.{ext}'
+            fig.savefig(output);outputs.append(str(output))
+        plt.close(fig)
+        fig,ax=plt.subplots(figsize=(7,5))
+        for method in sorted(set(r['method'] for r in exposure)):
+            sample=[r for r in exposure if r['method']==method]
+            ax.scatter([r['suppression_exposed_model'] for r in sample],
+                       [r['suppression_exposed_measured'] for r in sample],label=method)
+        mx=max([r['suppression_exposed_model'] for r in exposure]+[1])
+        ax.plot([0,mx],[0,mx],linestyle='--')
+        ax.set_xlabel('Independent custody model: suppressible events')
+        ax.set_ylabel('Executed relay/ledger: suppressible events')
+        ax.set_title('E10 suppression exposure, unanchored and un-witnessed')
+        ax.legend()
+        fig.tight_layout()
+        for ext in ('svg','pdf'):
+            output=run/'figures'/f'F10_suppression.{ext}'
+            fig.savefig(output);outputs.append(str(output))
+        plt.close(fig)
+    race=[r for r in fi if r.get('attack')=='ANCHOR_RACE_FORGED_PENDING' and r.get('copy')=='forged']
+    if race:
+        groups=defaultdict(list)
+        for r in race:groups[r['method']].append(int(r['accepted']))
+        fig,ax=plt.subplots(figsize=(8,4))
+        ax.bar(sorted(groups),[statistics.mean(groups[m]) for m in sorted(groups)])
+        ax.set_ylim(0,1.05)
+        ax.set_ylabel('Forged batches accepted / exercised races')
+        ax.set_title('E9 anchor race: accepted *forgery* (not availability)')
+        fig.tight_layout()
+        for ext in ('svg','pdf'):
+            output=run/'figures'/f'F9_anchor_race.{ext}'
             fig.savefig(output);outputs.append(str(output))
         plt.close(fig)
     frontier=summary.get('fi_cost_frontier',[])
@@ -185,7 +218,7 @@ def figures(run: Path, summary: dict) -> list[str]:
                        [r[y] for r in series],label=mode)
         ax.set_xlabel('Maximum simulated event-to-anchor wait (ms)')
         ax.set_ylabel('Measured gas per event' if has_gas else 'Executed anchor calls per event (not gas)')
-        ax.set_title('E11 observed cost–exposure points')
+        ax.set_title('E11 measured cost characterization (no optimization claim)')
         ax.legend()
         fig.tight_layout()
         for ext in ('svg','pdf'):

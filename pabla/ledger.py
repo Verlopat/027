@@ -44,11 +44,15 @@ class InMemoryLedger:
         self._identities[collector, epoch] = {"public_key": public_key, "revoked_block": 0, "recovery": recovery, "policy": policy_name}
         return {"block_number": self.block, "block_timestamp": self.clock}
     def register_fi(self, collector: str, epoch: int, root: str, count: int,
-                    *, policy_name: str = "FI") -> dict:
+                    *, policy_name: str = "FI", witness_public_key: str | None = None) -> dict:
         if policy_name not in ("FI", "FI-noerase", "FI-nochain") or not 1 <= count <= 10000:
             raise ProtocolError("invalid FI registration")
         result=self.register(collector,epoch,root,policy_name=policy_name)
         self._identities[(collector,epoch)]["forward_integrity"]=True
+        if witness_public_key is not None:
+            if not is_hex32(witness_public_key):
+                raise ProtocolError("invalid independent witness public key")
+            self._identities[(collector,epoch)]["witness_public_key"]=witness_public_key
         self._fi_schedules[(collector,epoch)]=[{"root":root,"start":1,"count":count}]
         return result
 
@@ -83,6 +87,12 @@ class InMemoryLedger:
     def identity(self, collector: str, epoch: int) -> dict | None:
         return self._identities.get((collector, epoch))
     def anchor(self, batch: Batch) -> dict:
+        return self._record_anchor(batch, witness_signature=None)
+
+    def anchor_attested(self, batch: Batch, *, witness_signature: str) -> dict:
+        return self._record_anchor(batch, witness_signature=witness_signature)
+
+    def _record_anchor(self, batch: Batch, *, witness_signature: str | None) -> dict:
         m = batch.manifest
         k = (m["collector_id"], m["epoch"], m["batch_number"])
         identity = self.identity(*k[:2])
@@ -90,6 +100,11 @@ class InMemoryLedger:
             raise ProtocolError("unauthorized/revoked epoch")
         if m.get("method") != identity["policy"]:
             raise ProtocolError("registered policy mismatch")
+        witness = identity.get("witness_public_key")
+        if witness:
+            from .protocol import valid_signature
+            if not witness_signature or not valid_signature(witness,batch.manifest_digest,witness_signature):
+                raise ProtocolError("independent witness authorization missing or invalid")
         if k in self._anchors:
             raise ProtocolError("duplicate anchor")
         if identity.get("forward_integrity"):
@@ -181,11 +196,27 @@ class AnvilLedger:
         return self._send(self.contract.functions.register(self.b32(collector_key(collector)), epoch,
                                                       self.b32(public_key), self.sender, self.b32(recovery), self.b32(digest("PABLA-POLICY-v1", policy_name))))
     def register_fi(self, collector: str, epoch: int, root: str, count: int,
-                    *, policy_name: str = "FI") -> dict:
+                    *, policy_name: str = "FI", witness_public_key: str | None = None) -> dict:
         if policy_name not in ("FI", "FI-noerase", "FI-nochain"):
             raise ProtocolError("invalid FI policy")
-        return self._send(self.contract.functions.registerFI(self.b32(collector_key(collector)),epoch,
-                            self.b32(root),count,self.sender,self.b32(digest("PABLA-POLICY-v1",policy_name))))
+        key=self.b32(collector_key(collector))
+        pol=self.b32(digest("PABLA-POLICY-v1",policy_name))
+        if witness_public_key is None:
+            return self._send(self.contract.functions.registerFI(key,epoch,
+                                    self.b32(root),count,self.sender,pol))
+        if not is_hex32(witness_public_key):
+            raise ProtocolError("invalid witness public key")
+        if len(self.web3.eth.accounts)<2:
+            raise ProtocolError("Anvil needs a separately controlled witness account")
+        witness_sender=next((x for x in self.web3.eth.accounts if x.lower()!=self.sender.lower()),None)
+        if witness_sender is None:
+            raise ProtocolError("witness sender must differ from collector")
+        result=self._send(self.contract.functions.registerFIWitness(key,epoch,
+                                self.b32(root),count,self.sender,witness_sender,pol))
+        if not hasattr(self,'_witness_settings'):
+            self._witness_settings={}
+        self._witness_settings[(collector,epoch)]=(witness_public_key,witness_sender)
+        return result
 
     def renew_fi(self, collector: str, epoch: int, root: str, count: int) -> dict:
         return self._send(self.contract.functions.renewFI(self.b32(collector_key(collector)),epoch,self.b32(root),count))
@@ -208,15 +239,55 @@ class AnvilLedger:
         from .protocol import Policy
         policy = next((name for name in ("P1", "B1", "B2", "B3", "B4", "A1", "A2", "A3", "A4", "A5", "FI", "FI-noerase", "FI-nochain")
                        if self.b32(digest("PABLA-POLICY-v1", name)) == bytes(policy_id)), None)
-        return {"public_key": bytes(key).hex(), "revoked_block": int(block), "recovery": bytes(recovery).hex(), "policy": policy, "forward_integrity":policy in ("FI", "FI-noerase", "FI-nochain")}
-    def anchor(self, batch: Batch) -> dict:
-        m = batch.manifest
-        args=(self.b32(collector_key(m["collector_id"])), m["epoch"],m["batch_number"],
+        witness_address = self.contract.functions.fiWitness(self.b32(collector_key(collector)),epoch).call() if policy in ("FI", "FI-noerase", "FI-nochain") else None
+        return {"public_key": bytes(key).hex(), "revoked_block": int(block), "recovery": bytes(recovery).hex(), "policy": policy, "forward_integrity":policy in ("FI", "FI-noerase", "FI-nochain"),"witness_address": witness_address}
+    def _anchor_args(self,batch: Batch):
+        m=batch.manifest
+        return (self.b32(collector_key(m["collector_id"])), m["epoch"],m["batch_number"],
               self.b32(batch.manifest_digest),self.b32(m["merkle_root"]),self.b32(m["last_chain"]),
               m["first_sequence"],m["last_sequence"],self.b32(m["previous_manifest_hash"]))
+
+    def anchor(self, batch: Batch) -> dict:
+        """Collector-only submission. It cannot pass witness-protected FI epochs."""
+        m=batch.manifest
+        args=self._anchor_args(batch)
         if "period" in m:
             return self._send(self.contract.functions.anchorFI(*args,m["period"],self.b32(m["schedule_root"])))
         return self._send(self.contract.functions.anchor(*args))
+
+    def anchor_attested(self, batch: Batch, *, witness_signature: str) -> dict:
+        """Witness-only submission after off-chain custody and signature checks.
+
+        Only the separately trusted witness EVM account can send this call.
+        Anvil's unlocked accounts are for tests, not an operational HSM.
+        """
+        from .protocol import valid_signature
+        m=batch.manifest
+        entry=getattr(self,'_witness_settings',{}).get((m['collector_id'],m['epoch']))
+        if entry is None:
+            raise ProtocolError('no separately registered FI witness')
+        witness_public_key,witness_sender=entry
+        if not valid_signature(witness_public_key,batch.manifest_digest,witness_signature):
+            raise ProtocolError('witness attestation missing or invalid')
+        args=self._anchor_args(batch)
+        if 'period' not in m:
+            raise ProtocolError('witness path requires forward-integrity batch')
+        fn=self.contract.functions.anchorFIWitness(*args,m['period'],self.b32(m['schedule_root']))
+        try:
+            from web3.exceptions import ContractCustomError, ContractLogicError, TimeExhausted
+            txid=fn.transact({'from':witness_sender})
+            receipt=self.web3.eth.wait_for_transaction_receipt(txid, timeout=self.timeout_seconds)
+        except (ContractCustomError,ContractLogicError,TimeExhausted,ValueError) as exc:
+            raise ProtocolError(f'witness anchor failed: {type(exc).__name__}: {exc}') from exc
+        if receipt['status'] != 1:
+            raise ProtocolError('reverted FI witness anchor')
+        self.calls+=1
+        block=self.web3.eth.get_block(receipt['blockNumber'])
+        txinput=self.web3.eth.get_transaction(txid)['input']
+        return {'block_number':int(receipt['blockNumber']),'block_timestamp':float(block['timestamp']),
+                'tx_hash':txid.hex(),'gas_used':int(receipt['gasUsed']),
+                'transaction_input_bytes':len(bytes(txinput)) if isinstance(txinput,bytes) else len(bytes.fromhex(txinput.removeprefix('0x')))}
+
     def anchor_record(self, collector: str, epoch: int, batch_number: int) -> dict | None:
         mh, root, last, first, end, block, ts = self.contract.functions.getAnchor(
             self.b32(collector_key(collector)), epoch, batch_number).call()

@@ -26,3 +26,106 @@ The game explicitly does **not** promise prevention of complete archive suppress
 For compromise timestamp `t` and last confirmed anchor `a(t)`, `W=t-a(t)` describes the **pre-compromise open window**. The count of exposed arrivals is computed from the trace's event-arrival timestamps and confirmed anchor times. It excludes the unbounded post-compromise interval until externally enforced revocation. E10 tests arithmetic of this model on seeded synthetic traces; E11 compares greedy deadline/size batching with fixed deadlines. The memory backend measures anchor **calls**, not Ethereum gas or finality latency.
 
 FI-nochain intentionally removes the event hash chain but keeps Merkle leaves bound to the sequence and signed manifest. Current attacks need not distinguish FI and FI-nochain; absent a genuine differential, do **not** claim that the hash chain is independently novel or essential.
+
+## Anchor-race adversary and independent witness custody (E9)
+
+`ANCHOR_RACE_FORGED_PENDING` instantiates an attacker that obtains the collector's
+signing state after batch *k* is signed, and also controls the collector's
+authorized **ledger submission credential**. The attacker submits a modified
+batch *k* before the genuine relay copy is anchored. A witness receives and
+retains a deep copy of the honest signed batch after a configurable transfer
+delay. E9 verifies **both** artifacts against the same committed root and
+records `relay_delivered_before_theft`, `witness_pending_preflight` and
+`availability_failure` for the honest copy.
+
+Static P1, B4, and FI-noerase can issue a valid replacement signature for the
+old period; FI and FI-nochain cannot, *subject to past-seed erasure*. **Critical
+limitation:** the current contract checks submitter identity and period/order,
+not Ed25519. An attacker authorized to submit can anchor an FI commitment with
+an **invalid** off-chain signature: its forged history is rejected by the
+verifier, but the displaced honest relay history also fails the immutable
+anchor check. This is a denial-of-service/availability failure, not an
+integrity break and not solved by the FI signature scheme. The new protected registration mitigates this with an independently controlled
+witness-only submission address, while the original legacy FI path remains as an
+explicit attack/control condition. This changes the trust model: witness compromise
+or refusal to serve is not solved by the cryptographic protocol.
+
+Witness custody does not imply the collector captured every event, and no
+protection exists for never-emitted events. The simulation uses discrete,
+controlled delivery times, not a validated network-delay distribution.
+
+## Independent witness-gated FI anchoring (protected variant)
+
+The optional protected FI registration (`registerFIWitness`) commits an independent
+EVM witness address *distinct from the compromised collector submitter*. Once
+registered, `anchorFI` is disabled for that epoch; only `anchorFIWitness` sent
+by the designated witness may claim the next slot. A Python relay verifies the
+registered period proof, Ed25519 manifest signature, Merkle and chain evidence,
+sequence continuity and byte-for-byte custody **before** submitting the original
+copy. This is not Ed25519 verification by the EVM. Both the authorization gate
+and the independent relay's key custody are necessary; compromise of the witness
+remains a residual trust failure. A missing/delayed relay causes anchoring delay
+rather than an irrevocable collector-forged anchor slot.
+
+E9 compares `FI+WITNESS` with FI-legacy (the latter deliberately vulnerable to
+anchor-slot denial). In the protected case the collector's forged submission
+reverts; once the relay copy arrives it can anchor and pass verification.
+The contract cannot prove the relay operator *actually* checked the batch; its
+security is conditional on the honest witness and independent EVM key management.
+A test deployment's unlocked Anvil accounts are NOT suitable operational custody.
+
+The FI anchor period equals the batch number by the contract's invariant.
+`getFIAnchor` now derives the schedule root from the retained registration
+schedule and the immutable batch existence record; **no FI-specific per-batch
+storage mapping** remains. This removes one potential 32-byte `SSTORE` per
+anchor but gas savings are unmeasured until matched before/after EVM trials.
+
+## Two operational exposure surfaces (E10)
+
+E10 now runs collector sign operations, actual in-memory or EVM anchor calls,
+witness delivery, an adaptive stolen-key mutation and the real verifier at
+sampled compromise timestamps. **Modification exposure** counts unsigned
+arrivals and un-witnessed signed pending records for which a real forged
+manifest passes signature verification. **Suppression exposure** counts
+unanchored and un-witnessed records for which the honest evidence can vanish
+from the observer's accessible archive. A signed pending batch retained by an
+independent witness need not be anchored to withstand complete local archive
+deletion; it still lacks finality. The two windows differ from one another and
+from the time between ledger confirmations.
+
+The independent predictor uses ledger/relay receipt times and the expected
+availability of the stolen period key, and is compared to the actual verifier
+outcomes. This is a controlled simulation with synthetic operation clocks, **not**
+empirically observed wall-clock compromise timing or network-delay variance.
+The anchor-confirmation delay is a declared synthetic parameter even in an
+Anvil run; measured transaction gas and timing remain separate.
+
+## E11 interpretation and gas validation
+
+E11 is a **cost/exposure characterization**, *not* a claim that the greedy
+adaptive anchor policy minimizes gas. `anchor_calls_per_event` is observable
+on the in-memory backend; `gas_per_event` is reported only if genuine Anvil
+receipts exist. The redundant FI-anchor period storage word has been removed:
+`period` is derived from `batchNumber` for the existing anchor, and the FI schedule root is now derived directly from the registered schedule
+without any dedicated FI per-anchor mapping. This may lower gas,
+but the improvement and its percentage are **unknown until both contract
+revisions are measured with the same Foundry/Anvil configuration**. Never
+present a source-code storage saving as a measured gas result.
+
+## E12 and scale limitations
+
+A small official LANL `redteam.txt.gz` (~4.8 KB) is suitable for functional
+trace-loader validation only; it is not a representative high-volume enterprise
+traffic benchmark. `dns.txt.gz` (~177 MB) is closer to a sizeable trace. Use
+`scripts/download_lanl.py` to retrieve either directly from the official LANL
+source, record a SHA-256 fingerprint, and invoke `Main.py --dataset-path ...`.
+The LANL source was not downloadable in the offline local environment; **E12
+has not been executed on a real dataset here**. `configs/full.json` defines
+the intended experiment grid, but **the ten independently reset full Anvil
+runs and pre/post contract gas comparison are not executed**. CI smoke tests
+and pilot-scale synthetic traces cannot substitute for those observations.
+
+The sequence-bound signed Merkle construction and on-chain ordering already
+detect every tested hash-chain/manifest-link attack in P1 and B4. The per-event
+hash chain is retained for backward compatibility and an explicit negative
+ablation, **not** claimed as a new security contribution.

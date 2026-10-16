@@ -36,9 +36,11 @@ contract CollectorAnchorRegistry {
     mapping(bytes32 => mapping(uint64 => uint64)) public latestSequence;
 
     struct FISchedule { bytes32 root; uint64 start; uint64 count; }
-    struct FIAnchor { uint64 period; bytes32 scheduleRoot; }
     mapping(bytes32 => mapping(uint64 => FISchedule[])) internal fiSchedules;
-    mapping(bytes32 => mapping(uint64 => mapping(uint64 => FIAnchor))) internal fiAnchors;
+    // FI period == batch number. Schedule roots are reconstructed from immutable
+    // schedule registration and the presence of an immutable anchor; no per-anchor
+    // FI storage slot is needed.
+    mapping(bytes32 => mapping(uint64 => address)) public fiWitness;
     mapping(bytes32 => mapping(uint64 => uint64)) public latestPeriod;
     event FIScheduleRegistered(bytes32 indexed collector, uint64 indexed epoch, bytes32 root, uint64 firstPeriod, uint64 count);
 
@@ -73,6 +75,25 @@ contract CollectorAnchorRegistry {
         emit FIScheduleRegistered(collector, epoch, scheduleRoot, 1, count);
     }
 
+    /// @notice Register independent witness-only FI anchoring. The witness EVM
+    /// account MUST be controlled independently of the collector submitter.
+    /// It must verify Ed25519 batch evidence and custody before it submits.
+    /// An attacker possessing the collector submitter cannot fill anchor slots.
+    function registerFIWitness(bytes32 collector, uint64 epoch, bytes32 scheduleRoot,
+                               uint64 count, address submitter, address witness,
+                               bytes32 policyId) external {
+        if (msg.sender != owner) revert Unauthorized();
+        if (witness == address(0) || witness == submitter) revert InvalidEpoch();
+        if (collector == 0 || scheduleRoot == 0 || count == 0 || count > 10000 ||
+            submitter == address(0) || policyId == 0 || epoch == 0 || epochs[collector][epoch].exists) revert InvalidEpoch();
+        if (epoch > 1 && (!epochs[collector][epoch-1].exists || epochs[collector][epoch-1].revokedBlock == 0)) revert InvalidEpoch();
+        epochs[collector][epoch] = Epoch(scheduleRoot, submitter, 0, true, bytes32(0), policyId);
+        fiSchedules[collector][epoch].push(FISchedule(scheduleRoot, 1, count));
+        fiWitness[collector][epoch] = witness;
+        emit Registered(collector, epoch, scheduleRoot, bytes32(0), policyId);
+        emit FIScheduleRegistered(collector, epoch, scheduleRoot, 1, count);
+    }
+
     function renewFI(bytes32 collector, uint64 epoch, bytes32 scheduleRoot, uint64 count) external {
         if (msg.sender != owner) revert Unauthorized();
         Epoch storage identity = epochs[collector][epoch];
@@ -97,8 +118,14 @@ contract CollectorAnchorRegistry {
 
     function getFIAnchor(bytes32 collector, uint64 epoch, uint64 batchNumber)
         external view returns (uint64, bytes32) {
-        FIAnchor memory anchorRecord = fiAnchors[collector][epoch][batchNumber];
-        return (anchorRecord.period, anchorRecord.scheduleRoot);
+        if (anchors[collector][epoch][batchNumber].blockNumber == 0) return (0, bytes32(0));
+        FISchedule[] storage schedules = fiSchedules[collector][epoch];
+        for (uint256 i = schedules.length; i > 0; --i) {
+            FISchedule storage schedule = schedules[i-1];
+            if (batchNumber >= schedule.start && batchNumber < schedule.start + schedule.count)
+                return (batchNumber, schedule.root);
+        }
+        return (0, bytes32(0));
     }
 
     function revoke(bytes32 collector, uint64 epoch) external {
@@ -125,7 +152,9 @@ contract CollectorAnchorRegistry {
         uint64 lastSequence, bytes32 previousManifestHash
     ) internal {
         Epoch storage entry = epochs[collector][epoch];
-        if (!entry.exists || msg.sender != entry.submitter || entry.revokedBlock != 0) revert Unauthorized();
+        address witness = fiWitness[collector][epoch];
+        if (!entry.exists || entry.revokedBlock != 0 ||
+            (msg.sender != entry.submitter && msg.sender != witness)) revert Unauthorized();
         if (manifestHash == 0 || merkleRoot == 0 || batchNumber == 0 || lastSequence < firstSequence) revert InvalidAnchor();
         if (batchNumber != latestBatch[collector][epoch] + 1) revert InvalidAnchor();
         if (firstSequence != latestSequence[collector][epoch] + 1) revert InvalidAnchor();
@@ -150,11 +179,37 @@ contract CollectorAnchorRegistry {
         emit Anchored(collector, epoch, batchNumber, manifestHash, merkleRoot);
     }
 
+    /// @dev Legacy FI anchoring is permitted only for explicitly unprotected
+    /// experimental epochs. Never allow it to bypass witness-only epochs.
     function anchorFI(
         bytes32 collector, uint64 epoch, uint64 batchNumber, bytes32 manifestHash,
         bytes32 merkleRoot, bytes32 lastChain, uint64 firstSequence,
         uint64 lastSequence, bytes32 previousManifestHash, uint64 period, bytes32 scheduleRoot
     ) external {
+        if (fiWitness[collector][epoch] != address(0)) revert Unauthorized();
+        _anchorFI(collector,epoch,batchNumber,manifestHash,merkleRoot,lastChain,
+                  firstSequence,lastSequence,previousManifestHash,period,scheduleRoot);
+    }
+
+    /// @notice Protected FI anchor: ONLY an independent authorized witness can
+    /// commit after validating the pending batch's signing proof and payload.
+    /// A forged commitment submitted by a compromised collector is rejected.
+    function anchorFIWitness(
+        bytes32 collector, uint64 epoch, uint64 batchNumber, bytes32 manifestHash,
+        bytes32 merkleRoot, bytes32 lastChain, uint64 firstSequence,
+        uint64 lastSequence, bytes32 previousManifestHash, uint64 period, bytes32 scheduleRoot
+    ) external {
+        if (fiWitness[collector][epoch] == address(0) ||
+            msg.sender != fiWitness[collector][epoch]) revert Unauthorized();
+        _anchorFI(collector,epoch,batchNumber,manifestHash,merkleRoot,lastChain,
+                  firstSequence,lastSequence,previousManifestHash,period,scheduleRoot);
+    }
+
+    function _anchorFI(
+        bytes32 collector, uint64 epoch, uint64 batchNumber, bytes32 manifestHash,
+        bytes32 merkleRoot, bytes32 lastChain, uint64 firstSequence,
+        uint64 lastSequence, bytes32 previousManifestHash, uint64 period, bytes32 scheduleRoot
+    ) internal {
         if (fiSchedules[collector][epoch].length == 0 || period != batchNumber ||
             period != latestPeriod[collector][epoch] + 1) revert InvalidAnchor();
         FISchedule[] storage schedules = fiSchedules[collector][epoch];
@@ -170,7 +225,6 @@ contract CollectorAnchorRegistry {
         // Delegate immutable anchoring invariants to the shared internal routine.
         _anchor(collector,epoch,batchNumber,manifestHash,merkleRoot,lastChain,
                 firstSequence,lastSequence,previousManifestHash);
-        fiAnchors[collector][epoch][batchNumber] = FIAnchor(period,scheduleRoot);
         latestPeriod[collector][epoch] = period;
     }
 

@@ -56,3 +56,37 @@ def exposed_events(arrivals: Sequence[int], anchored: Sequence[Window], compromi
 def exposed_interval_ms(anchored: Sequence[Window], compromise_ms: int) -> int:
     last_confirmed=max((w.confirmed_ms for w in anchored if w.confirmed_ms < compromise_ms),default=0)
     return compromise_ms-last_confirmed
+
+
+@dataclass(frozen=True)
+class Exposure:
+    """Distinct operational damage surfaces observed at compromise.
+
+    modification: events lacking an independently delivered signed witness copy.
+    suppression: events lacking an independently confirmed on-chain anchor.
+    Relay custody prevents deletion of its copy, but does not force anchoring.
+    """
+    modification_events: int
+    suppression_events: int
+    last_delivered_ms: int | None
+    last_anchor_ms: int | None
+
+
+def exposure_windows(arrivals: Sequence[int], windows_: Sequence[Window],
+                     compromise_ms: int, *, relay_delay_ms: int) -> Exposure:
+    if relay_delay_ms < 0 or compromise_ms < 0:
+        raise ValueError('invalid timing')
+    # An event belongs to the batch committed when that batch closes.
+    deliver_at={i:w.confirmed_ms+relay_delay_ms for w in windows_
+                for i in range(w.first_index,w.last_index+1)}
+    anchored_at={i:w.confirmed_ms for w in windows_
+                 for i in range(w.first_index,w.last_index+1)}
+    observed=[i for i,t in enumerate(arrivals) if t<=compromise_ms]
+    # "signature left host" means independently received, not just locally signed.
+    modified=sum(deliver_at.get(i,float('inf'))>compromise_ms for i in observed)
+    suppressed=sum(anchored_at.get(i,float('inf'))>compromise_ms for i in observed)
+    last_delivery=max((w.confirmed_ms+relay_delay_ms for w in windows_
+                       if w.confirmed_ms+relay_delay_ms<=compromise_ms),default=None)
+    last_anchor=max((w.confirmed_ms for w in windows_
+                     if w.confirmed_ms<=compromise_ms),default=None)
+    return Exposure(modified,suppressed,last_delivery,last_anchor)
