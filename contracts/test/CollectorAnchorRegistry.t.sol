@@ -3,11 +3,10 @@ pragma solidity 0.8.26;
 import "../src/CollectorAnchorRegistry.sol";
 
 contract Outsider {
-    function submit(CollectorAnchorRegistry target, bytes32 collector) external returns (bool) {
-        (bool ok,) = address(target).call(abi.encodeWithSelector(target.anchor.selector,
+    function submit(CollectorAnchorRegistry target, bytes32 collector) external returns (bool, bytes memory) {
+        return address(target).call(abi.encodeWithSelector(target.anchor.selector,
             collector,uint64(1),uint64(1),bytes32(uint256(2)),bytes32(uint256(3)),
             bytes32(uint256(4)),uint64(1),uint64(2),bytes32(0)));
-        return ok;
     }
 }
 
@@ -34,7 +33,12 @@ contract RegistryTest {
         bytes32 c=keccak256("collector-b");
         r.register(c,1,bytes32(uint256(5)),address(this),0,bytes32(uint256(1)));
         Outsider attacker = new Outsider();
-        require(!attacker.submit(r,c),"unauthorized sender accepted under active epoch");
+        (bool outsiderAccepted, bytes memory revertData) = attacker.submit(r,c);
+        require(!outsiderAccepted, "unauthorized sender accepted under active epoch");
+        require(revertData.length >= 4, "missing unauthorized selector");
+        bytes4 selector;
+        assembly { selector := mload(add(revertData, 32)) }
+        require(selector == CollectorAnchorRegistry.Unauthorized.selector, "wrong revert reason");
         r.revoke(c,1);
         (bool accepted,) = address(r).call(abi.encodeWithSelector(r.anchor.selector,
             c,uint64(1),uint64(1),bytes32(uint256(10)),bytes32(uint256(20)),
@@ -57,5 +61,21 @@ contract StrictLinkTest {
             c,uint64(1),uint64(2),bytes32(uint256(11)),bytes32(uint256(21)),
             bytes32(uint256(31)),uint64(3),uint64(4),bytes32(0)));
         require(!accepted,"missing manifest link accepted");
+    }
+}
+
+contract SameBlockRevocationTest {
+    function testAnchorBeforeRevocationSameBlockRemainsValid() public {
+        CollectorAnchorRegistry r = new CollectorAnchorRegistry();
+        bytes32 c = keccak256("same-block-revocation");
+        bytes32 policy = hex"c0af4ce3b96e055e3f5e99bcc34ce9098ffacc2ed890c6ff8ebb8ea8b0c9a582";
+        r.register(c, 1, bytes32(uint256(5)), address(this), 0, policy);
+        r.anchor(c, 1, 1, bytes32(uint256(11)), bytes32(uint256(12)),
+                 bytes32(uint256(13)), 1, 1, 0);
+        (, , , , , uint64 anchorBlock, ) = r.getAnchor(c, 1, 1);
+        r.revoke(c, 1);
+        (, , uint64 effectiveRevocationBlock, , , ) = r.getEpoch(c, 1);
+        require(anchorBlock == uint64(block.number), "different block");
+        require(effectiveRevocationBlock == uint64(block.number+1), "same-block valid anchor could be rejected");
     }
 }

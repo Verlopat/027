@@ -39,3 +39,24 @@ jobs:
           uv run python scripts/deploy_contract.py
           export PABLA_CONTRACT=$(python -c 'import json;print(json.load(open("contract-deployment.json"))["address"])')
           uv run python Main.py --backend anvil --require-chain --trials 1 --events 12 --batch-size 6
+  dependency-lock:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: astral-sh/setup-uv@v6
+      - name: Resolve universal reproducible Python lock
+        run: uv lock
+      - name: Commit updated dependency lock, if changed
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add uv.lock
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: lock Python dependency graph'
+            git push origin HEAD:main
+          fi
