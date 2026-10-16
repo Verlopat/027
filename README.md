@@ -16,7 +16,7 @@ forge --version
 
 Recommended: Python 3.12/3.13, `uv`, Foundry/Anvil for genuine blockchain experiments. Use a dedicated venv, never `sudo pip`. No real Ethereum private keys or public networks are required.
 
-## Quick start (local cryptographic smoke test + E1–E8 experiment suite)
+## Quick start (local cryptographic smoke test + E1–E7 experiment suite)
 
 ```sh
 git clone https://github.com/Verlopat/027.git
@@ -60,7 +60,7 @@ Default is intentionally laptop-safe (pilot profile). The `full` profile increas
 - `pabla/ledger.py`: persistent-on-chain EVM registry adapter and independently labeled in-memory test ledger.
 - `contracts/`: Solidity registry, epoch revocation, monotonic anchor sequencing and contract tests.
 - `pabla/workloads.py`: deterministic synthetic telemetry and post-commitment attack injection.
-- `pabla/experiments.py`: experimental profiles, paired trial framework, E1–E8 raw observation generation.
+- `pabla/experiments.py`: experimental profiles, paired trial framework, E1–E7 raw observation generation.
 - `pabla/analysis.py`: exact binomial confidence intervals, paired McNemar and Holm-adjusted comparisons, bootstrap CIs, plots.
 - `pabla/storage.py`: per-run directories, atomic artifact writes and SQLite indexing.
 - `Main.py`: single-entrypoint workflow; no manuscript files are created.
@@ -98,8 +98,32 @@ MIT (see `LICENSE`).
 
 The verifier now requires an explicit, registry-bound trusted policy. Manifest-provided `method` is treated as untrusted input; warning classifications never bypass cryptographic or anchor checks. `verify_complete_history` compares the verified archive against the on-chain latest batch and sequence; simple `verify_history` validates the supplied prefix only. EVM transaction reverts are converted into traceable `ProtocolError` outcomes. Collector identities bind the policy digest on the contract, so the modified contract requires redeployment (its ABI is not compatible with the earlier contract).
 
-Security trial summaries distinguish adaptive attacks and do not attach pseudoreplicated significance tests to deterministic detection. Construction and anchor timings are separated. E7 uses isolated subprocesses for RSS/CPU measurements. GitHub Actions includes a pinned Foundry v1.5.0 job, Foundry contract tests and a minimal real-Anvil integration run. **Local development did not include a live Foundry/Anvil toolchain or an online dependency resolution**. GitHub Actions validates the live-EVM integration and includes an online job to generate and commit a `uv.lock` dependency graph when needed.
+Security trial summaries distinguish adaptive attacks and do not attach pseudoreplicated significance tests to deterministic detection. Construction and anchor timings are separated. E7 uses isolated subprocesses for RSS/CPU measurements. GitHub Actions includes a pinned Foundry v1.5.0 job, Foundry contract tests and a minimal real-Anvil integration run. **Local development did not include a live Foundry/Anvil toolchain or an online dependency resolution**, so live-EVM results and a `uv.lock` file must be generated/validated in a networked environment.
 
 The implementation remains research software, not a production deployment or proof of scientific novelty. Unresolved journal requirements include independently reset EVM runs for unbiased comparison, a truly external evaluated baseline, stronger formal provenance claims, a frozen full experiment matrix, and independent audit. Internal ablations that fail to demonstrate unique detection capability must be reported as negative findings, not discarded.
 
-An E8 comparison evaluates signed Certificate Transparency-style binary history trees with independently verified inclusion and append-only consistency proofs. The code is a reference implementation for evidence semantics, not an optimized CT service; performance superiority over mature CT deployments is not claimed.
+## PABLA-FI research extension (E9–E12)
+
+The `FI` policy registers a period-public-key Merkle schedule, ratchets Ed25519
+signing seeds per batch, enforces monotonic period anchoring and performs
+period-to-root inclusion verification. `FI-noerase` and `FI-nochain` are explicit
+ablations. `pabla/anchoring.py` implements deadline/size rules, while E9–E11
+record key-compromise classifications, synthetic exposure counts and executed
+anchor-call cost tradeoffs. E12 streams externally supplied LANL relative-time
+records and stores the source SHA-256 digest.
+
+```bash
+uv sync --extra test --extra parquet
+uv run pytest -q
+uv run python Main.py --trials 2 --events 24 --batch-size 12
+# With independently obtained LANL auth.txt.gz or proc.txt.gz:
+uv run python Main.py --dataset-path /path/to/auth.txt.gz
+# Live EVM run requires installed Anvil, compiled Foundry contract and PABLA_CONTRACT:
+uv run python Main.py --backend anvil --require-chain --trials 1 --events 24
+```
+
+See `docs/forward-integrity.md` and `docs/experiment-interpretation.md` for
+explicit compromise limitations, proof assumptions, measurement provenance,
+models versus observations, the distinction between CT checkpoints and anchored
+CT roots, and known incomplete validations. Neither journal novelty nor
+production key erasure is established by a passing test suite.

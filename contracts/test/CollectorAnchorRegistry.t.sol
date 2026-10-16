@@ -79,3 +79,40 @@ contract SameBlockRevocationTest {
         require(effectiveRevocationBlock == uint64(block.number+1), "same-block valid anchor could be rejected");
     }
 }
+
+contract ForwardIntegrityRegistryTest {
+    function testPeriodRegistrationRenewalAndBackfill() public {
+        CollectorAnchorRegistry r=new CollectorAnchorRegistry();
+        bytes32 collector=keccak256("FI-COLLECTOR");
+        bytes32 policy=keccak256("FI-POLICY");
+        bytes32 firstRoot=keccak256("SCHEDULE-1");
+        bytes32 secondRoot=keccak256("SCHEDULE-2");
+        r.registerFI(collector,1,firstRoot,2,address(this),policy);
+        (bytes32 root, uint64 start, uint64 count)=r.getFISchedule(collector,1,1);
+        require(root==firstRoot && start==1 && count==2,"schedule not committed");
+        r.anchorFI(collector,1,1,bytes32(uint256(11)),bytes32(uint256(12)),bytes32(uint256(13)),1,2,0,1,firstRoot);
+        require(r.latestPeriod(collector,1)==1,"incorrect period tip");
+        (bool backfill,) = address(r).call(abi.encodeWithSelector(r.anchorFI.selector,
+            collector,uint64(1),uint64(2),bytes32(uint256(14)),bytes32(uint256(15)),
+            bytes32(uint256(16)),uint64(3),uint64(4),bytes32(uint256(11)),uint64(1),firstRoot));
+        require(!backfill,"period backfill accepted");
+        (bool wrongRoot,) = address(r).call(abi.encodeWithSelector(r.anchorFI.selector,
+            collector,uint64(1),uint64(2),bytes32(uint256(14)),bytes32(uint256(15)),
+            bytes32(uint256(16)),uint64(3),uint64(4),bytes32(uint256(11)),uint64(2),secondRoot));
+        require(!wrongRoot,"unregistered root accepted");
+        r.anchorFI(collector,1,2,bytes32(uint256(14)),bytes32(uint256(15)),bytes32(uint256(16)),3,4,bytes32(uint256(11)),2,firstRoot);
+        r.renewFI(collector,1,secondRoot,4);
+        (root,start,count)=r.getFISchedule(collector,1,3);
+        require(root==secondRoot && start==3 && count==4,"schedule renewal failed");
+        (root,start,count)=r.getFISchedule(collector,1,1);
+        require(root==firstRoot && start==1,"old schedule lost");
+        r.anchorFI(collector,1,3,bytes32(uint256(17)),bytes32(uint256(18)),bytes32(uint256(19)),5,6,bytes32(uint256(14)),3,secondRoot);
+        (uint64 p,bytes32 anchoredRoot)=r.getFIAnchor(collector,1,3);
+        require(p==3 && anchoredRoot==secondRoot,"period-to-anchor not bound");
+        r.revoke(collector,1);
+        (bool revoked,) = address(r).call(abi.encodeWithSelector(r.anchorFI.selector,
+            collector,uint64(1),uint64(4),bytes32(uint256(17)),bytes32(uint256(18)),
+            bytes32(uint256(19)),uint64(7),uint64(8),bytes32(uint256(17)),uint64(4),secondRoot));
+        require(!revoked,"revoked FI epoch anchored");
+    }
+}

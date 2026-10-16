@@ -237,6 +237,7 @@ class Policy:
     anchor: bool = True
     revoke_check: bool = True
     timestamps: bool = True
+    forward_integrity: bool = False
     @staticmethod
     def for_name(name: str) -> 'Policy':
         presets = {
@@ -250,6 +251,9 @@ class Policy:
             "A3": {"anchor": False},
             "A4": {"revoke_check": False},
             "A5": {"timestamps": False},
+            "FI": {"forward_integrity": True},
+            "FI-noerase": {"forward_integrity": True},
+            "FI-nochain": {"forward_integrity": True, "chain": False},
         }
         if name not in presets:
             raise ProtocolError(f"unknown method {name}")
@@ -281,9 +285,12 @@ class Collector:
     next_batch: int = 1
     last_chain: str = ""
     last_manifest: str = ZERO
+    evolving: Any | None = None
     def __post_init__(self) -> None:
         if self.epoch < 1 or not self.collector_id:
             raise ProtocolError("invalid collector identity")
+        if self.policy.forward_integrity and self.evolving is None:
+            raise ProtocolError("FI collector requires an evolving signer")
         if not self.last_chain:
             self.last_chain = genesis(self.collector_id, self.epoch)
     def collect(self, events: list[dict[str, Any]], *, wall_time: str | None = None, monotonic_ns: int | None = None) -> Batch:
@@ -316,8 +323,16 @@ class Collector:
             "monotonic_ns": monotonic_ns if monotonic_ns is not None else time.monotonic_ns(),
             "method": self.policy.name,
         }
+        if self.policy.forward_integrity:
+            period = self.evolving.current_period
+            m.update({"period": period, "period_pk": self.evolving.current_public(),
+                      "period_proof": self.evolving.proof(period),
+                      "schedule_root": self.evolving.root})
         mh = manifest_hash(m)
-        sig = sign(self.private_key, mh) if self.policy.sign_batches else ""
+        if self.policy.forward_integrity:
+            _,_,_,sig = self.evolving.sign_and_evolve(mh)
+        else:
+            sig = sign(self.private_key, mh) if self.policy.sign_batches else ""
         batch = Batch(m, sig, list(events), mh, leaves)
         self.last_manifest = mh
         self.next_batch += 1
@@ -329,8 +344,9 @@ class Verdict:
     status: str
     anomalies: list[str]
     manifest_digest: str | None = None
+    exposure: str | None = None
     def as_dict(self) -> dict[str, Any]:
-        return {"status": self.status, "anomalies": self.anomalies, "manifest_digest": self.manifest_digest}
+        return {"status": self.status, "anomalies": self.anomalies, "manifest_digest": self.manifest_digest, "exposure": self.exposure}
 
 
 def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: Policy,
@@ -362,7 +378,21 @@ def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: P
         identity = ledger.identity(collector, epoch)
         if identity and identity.get("policy") != method.name:
             return Verdict("REJECT_AUTHORIZATION", ["REGISTRY_POLICY_MISMATCH"])
-        if method.sign_batches:
+        if method.forward_integrity:
+            if not identity or not identity.get("forward_integrity"):
+                return Verdict("REJECT_AUTHORIZATION", ["FI_SCHEDULE_NOT_REGISTERED"])
+            from .keyschedule import validate_period_proof
+            period = m.get("period")
+            if type(period) is not int or period != bn or not isinstance(m.get("period_proof"), list):
+                return Verdict("REJECT_AUTHORIZATION", ["FI_PERIOD_MISMATCH"])
+            schedule = ledger.fi_schedule(collector, epoch, period)
+            if not schedule or m.get("schedule_root") != schedule["root"] or not validate_period_proof(
+                    period, m.get("period_pk", ""), m["period_proof"], schedule["root"],
+                    schedule["start"], schedule["count"]):
+                return Verdict("REJECT_AUTHORIZATION", ["FI_KEY_PROOF_INVALID"])
+            if not valid_signature(m["period_pk"], recorded_digest, batch.signature):
+                return Verdict("REJECT_AUTHORIZATION", ["FI_SIGNATURE_INVALID"])
+        if method.sign_batches and not method.forward_integrity:
             if not identity:
                 return Verdict("REJECT_AUTHORIZATION", ["UNREGISTERED_COLLECTOR"])
             if not valid_signature(identity["public_key"], recorded_digest, batch.signature):
@@ -410,6 +440,9 @@ def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: P
                 return Verdict("REJECT_ANCHOR", ["ANCHOR_MISSING"])
             if anchor["manifest_hash"] != recorded_digest or anchor["merkle_root"] != m["merkle_root"] or anchor["last_chain"] != m["last_chain"] or anchor["first_sequence"] != first or anchor["last_sequence"] != last:
                 return Verdict("REJECT_ANCHOR", ["ANCHOR_MISMATCH"])
+            if method.forward_integrity and (anchor.get("period") != m["period"] or
+                                             anchor.get("schedule_root") != m["schedule_root"]):
+                return Verdict("REJECT_ANCHOR", ["FI_ANCHOR_PERIOD_MISMATCH"])
             if method.revoke_check and identity and identity.get("revoked_block") and anchor["block_number"] >= identity["revoked_block"]:
                 return Verdict("REJECT_AUTHORIZATION", ["REVOKED_EPOCH"])
         if method.timestamps:
@@ -418,7 +451,8 @@ def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: P
                 warnings.append("CLOCK_SKEW")
             if any(abs(unix_seconds(ev["event_time_utc"]) - timestamp) > max_skew_seconds for ev in batch.events):
                 warnings.append("EVENT_CLOCK_SKEW")
-        return Verdict("ACCEPT_WITH_WARNING" if warnings else "ACCEPT", warnings, recorded_digest)
+        return Verdict("ACCEPT_WITH_WARNING" if warnings else "ACCEPT", warnings, recorded_digest,
+                       "PROTECTED" if method.anchor else "IN_WINDOW_UNVERIFIABLE")
     except (ProtocolError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
         return Verdict("REJECT_CONTENT_INTEGRITY", ["MALFORMED_ARTIFACT", type(exc).__name__])
 
@@ -454,3 +488,30 @@ def verify_complete_history(batches: list[Batch | dict[str, Any] | None], ledger
     if policy.anchor and (m.get("batch_number") != tip_batch or m.get("last_sequence") != tip_sequence):
         verdicts.append(Verdict("REJECT_CONTINUITY", ["TRUNCATION"]))
     return verdicts
+
+
+def verify_pending_batch(batch: Batch, ledger: Any, *, policy: Policy,
+                         previous: dict[str,Any] | None) -> Verdict:
+    """Validate a signed but NOT YET anchored batch; never claim ledger protection.
+
+    The caller pins policy and authenticated schedule. Results are provisional:
+    an attacker may suppress the archive and the verifier cannot prove existence.
+    """
+    if not policy.sign_batches or not policy.anchor:
+        return Verdict("REJECT_AUTHORIZATION", ["UNSUITABLE_PENDING_POLICY"])
+    m=batch.manifest
+    collector,epoch=m.get("collector_id"),m.get("epoch")
+    tip_bn,tip_seq=ledger.latest(collector,epoch)
+    if m.get("batch_number") != tip_bn+1 or m.get("first_sequence") != tip_seq+1:
+        return Verdict("REJECT_CONTINUITY", ["PENDING_NOT_NEXT_AFTER_ANCHOR"])
+    # Only the off-chain anchor requirement is relaxed, never signing, key proof,
+    # continuity, Merkle verification, or trusted policy.
+    from dataclasses import replace
+    pending_policy=replace(policy, anchor=False)
+    # verify_batch compares the manifest's pinned policy name, unchanged here.
+    verdict=verify_batch(batch,ledger,policy=pending_policy,previous=previous)
+    if verdict.status in ("ACCEPT", "ACCEPT_WITH_WARNING"):
+        verdict.exposure="IN_WINDOW_UNVERIFIABLE"
+        verdict.anomalies.append("UNANCHORED_PENDING")
+        verdict.status="ACCEPT_WITH_WARNING"
+    return verdict

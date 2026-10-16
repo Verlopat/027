@@ -24,6 +24,7 @@ class InMemoryLedger:
     def __init__(self, clock: float | None = None) -> None:
         self._identities: dict[tuple[str, int], dict[str, Any]] = {}
         self._anchors: dict[tuple[str, int, int], dict[str, Any]] = {}
+        self._fi_schedules: dict[tuple[str,int],list[dict]] = {}
         self.block = 1
         self.clock = clock if clock is not None else time.time()
         self.calls = 0
@@ -42,6 +43,35 @@ class InMemoryLedger:
         self.calls += 1
         self._identities[collector, epoch] = {"public_key": public_key, "revoked_block": 0, "recovery": recovery, "policy": policy_name}
         return {"block_number": self.block, "block_timestamp": self.clock}
+    def register_fi(self, collector: str, epoch: int, root: str, count: int,
+                    *, policy_name: str = "FI") -> dict:
+        if policy_name not in ("FI", "FI-noerase", "FI-nochain") or not 1 <= count <= 10000:
+            raise ProtocolError("invalid FI registration")
+        result=self.register(collector,epoch,root,policy_name=policy_name)
+        self._identities[(collector,epoch)]["forward_integrity"]=True
+        self._fi_schedules[(collector,epoch)]=[{"root":root,"start":1,"count":count}]
+        return result
+
+    def renew_fi(self, collector: str, epoch: int, root: str, count: int) -> dict:
+        rec=self.identity(collector,epoch)
+        if not rec or not rec.get("forward_integrity") or rec["revoked_block"] or not is_hex32(root) or not 1 <= count <= 10000:
+            raise ProtocolError("invalid FI schedule renewal")
+        self.block+=1
+        self.calls+=1
+        start=self.latest_period(collector,epoch)+1
+        self._fi_schedules[(collector,epoch)].append({"root":root,"start":start,"count":count})
+        return {"block_number":self.block,"block_timestamp":self.clock}
+
+    def fi_schedule(self, collector: str, epoch: int, period: int) -> dict | None:
+        for x in reversed(self._fi_schedules.get((collector,epoch), [])):
+            if x["start"]<=period<x["start"]+x["count"]:
+                return x
+        return None
+
+    def latest_period(self, collector: str, epoch: int) -> int:
+        records=[r.get("period",0) for (c,e,_),r in self._anchors.items() if (c,e)==(collector,epoch)]
+        return max(records,default=0)
+
     def revoke(self, collector: str, epoch: int) -> dict:
         rec = self.identity(collector, epoch)
         if not rec or rec["revoked_block"]:
@@ -62,6 +92,11 @@ class InMemoryLedger:
             raise ProtocolError("registered policy mismatch")
         if k in self._anchors:
             raise ProtocolError("duplicate anchor")
+        if identity.get("forward_integrity"):
+            p=m.get("period")
+            schedule=self.fi_schedule(*k[:2],p) if type(p) is int else None
+            if p != self.latest_period(*k[:2])+1 or p != k[2] or not schedule or m.get("schedule_root") != schedule["root"]:
+                raise ProtocolError("FI period backfill or schedule mismatch")
         prev_key = (k[0], k[1], k[2] - 1)
         if k[2] == 1:
             if m["first_sequence"] != 1:
@@ -70,7 +105,7 @@ class InMemoryLedger:
             prev = self._anchors.get(prev_key)
             if not prev or prev["last_sequence"] + 1 != m["first_sequence"]:
                 raise ProtocolError("nonconsecutive chain anchor")
-            if identity["policy"] in ("P1", "A1", "A4", "A5") and m["previous_manifest_hash"] != prev["manifest_hash"]:
+            if identity["policy"] in ("P1", "A1", "A4", "A5", "FI", "FI-noerase", "FI-nochain") and m["previous_manifest_hash"] != prev["manifest_hash"]:
                 raise ProtocolError("previous manifest commitment mismatch")
         self.block += 1
         self.calls += 1
@@ -80,6 +115,9 @@ class InMemoryLedger:
                "last_sequence": m["last_sequence"], "block_number": self.block,
                "block_timestamp": self.clock,
                "tx_hash": digest("PABLA-TEST-RECEIPT", k[0], k[1], k[2], batch.manifest_digest)}
+        if identity.get("forward_integrity"):
+            rec["period"]=m["period"]
+            rec["schedule_root"]=m["schedule_root"]
         self._anchors[k] = rec
         return rec
     def anchor_record(self, collector: str, epoch: int, batch_number: int) -> dict | None:
@@ -142,6 +180,25 @@ class AnvilLedger:
     def register(self, collector: str, epoch: int, public_key: str, *, recovery: str = "00" * 32, policy_name: str = "P1") -> dict:
         return self._send(self.contract.functions.register(self.b32(collector_key(collector)), epoch,
                                                       self.b32(public_key), self.sender, self.b32(recovery), self.b32(digest("PABLA-POLICY-v1", policy_name))))
+    def register_fi(self, collector: str, epoch: int, root: str, count: int,
+                    *, policy_name: str = "FI") -> dict:
+        if policy_name not in ("FI", "FI-noerase", "FI-nochain"):
+            raise ProtocolError("invalid FI policy")
+        return self._send(self.contract.functions.registerFI(self.b32(collector_key(collector)),epoch,
+                            self.b32(root),count,self.sender,self.b32(digest("PABLA-POLICY-v1",policy_name))))
+
+    def renew_fi(self, collector: str, epoch: int, root: str, count: int) -> dict:
+        return self._send(self.contract.functions.renewFI(self.b32(collector_key(collector)),epoch,self.b32(root),count))
+
+    def fi_schedule(self, collector: str, epoch: int, period: int) -> dict | None:
+        root,start,count=self.contract.functions.getFISchedule(self.b32(collector_key(collector)),epoch,period).call()
+        if not count:
+            return None
+        return {"root":bytes(root).hex(),"start":int(start),"count":int(count)}
+
+    def latest_period(self, collector: str, epoch: int) -> int:
+        return int(self.contract.functions.latestPeriod(self.b32(collector_key(collector)),epoch).call())
+
     def revoke(self, collector: str, epoch: int) -> dict:
         return self._send(self.contract.functions.revoke(self.b32(collector_key(collector)), epoch))
     def identity(self, collector: str, epoch: int) -> dict | None:
@@ -149,23 +206,29 @@ class AnvilLedger:
         if not exists:
             return None
         from .protocol import Policy
-        policy = next((name for name in ("P1", "B1", "B2", "B3", "B4", "A1", "A2", "A3", "A4", "A5")
+        policy = next((name for name in ("P1", "B1", "B2", "B3", "B4", "A1", "A2", "A3", "A4", "A5", "FI", "FI-noerase", "FI-nochain")
                        if self.b32(digest("PABLA-POLICY-v1", name)) == bytes(policy_id)), None)
-        return {"public_key": bytes(key).hex(), "revoked_block": int(block), "recovery": bytes(recovery).hex(), "policy": policy}
+        return {"public_key": bytes(key).hex(), "revoked_block": int(block), "recovery": bytes(recovery).hex(), "policy": policy, "forward_integrity":policy in ("FI", "FI-noerase", "FI-nochain")}
     def anchor(self, batch: Batch) -> dict:
         m = batch.manifest
-        return self._send(self.contract.functions.anchor(
-            self.b32(collector_key(m["collector_id"])), m["epoch"], m["batch_number"],
-            self.b32(batch.manifest_digest), self.b32(m["merkle_root"]), self.b32(m["last_chain"]),
-            m["first_sequence"], m["last_sequence"], self.b32(m["previous_manifest_hash"])))
+        args=(self.b32(collector_key(m["collector_id"])), m["epoch"],m["batch_number"],
+              self.b32(batch.manifest_digest),self.b32(m["merkle_root"]),self.b32(m["last_chain"]),
+              m["first_sequence"],m["last_sequence"],self.b32(m["previous_manifest_hash"]))
+        if "period" in m:
+            return self._send(self.contract.functions.anchorFI(*args,m["period"],self.b32(m["schedule_root"])))
+        return self._send(self.contract.functions.anchor(*args))
     def anchor_record(self, collector: str, epoch: int, batch_number: int) -> dict | None:
         mh, root, last, first, end, block, ts = self.contract.functions.getAnchor(
             self.b32(collector_key(collector)), epoch, batch_number).call()
         if block == 0:
             return None
-        return {"manifest_hash": bytes(mh).hex(), "merkle_root": bytes(root).hex(),
+        record={"manifest_hash": bytes(mh).hex(), "merkle_root": bytes(root).hex(),
                 "last_chain": bytes(last).hex(), "first_sequence": int(first),
                 "last_sequence": int(end), "block_number": int(block), "block_timestamp": float(ts)}
+        period, schedule_root=self.contract.functions.getFIAnchor(self.b32(collector_key(collector)),epoch,batch_number).call()
+        if period:
+            record.update(period=int(period),schedule_root=bytes(schedule_root).hex())
+        return record
 
     def latest(self, collector: str, epoch: int) -> tuple[int, int]:
         key = self.b32(collector_key(collector))

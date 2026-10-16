@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument('--rpc',default=os.getenv('PABLA_RPC','http://127.0.0.1:8545'))
     parser.add_argument('--address',default=os.getenv('PABLA_CONTRACT',''))
     parser.add_argument('--require-chain',action='store_true')
+    parser.add_argument('--dataset-path',default=os.getenv('PABLA_LANL_DATASET',''))
     args=parser.parse_args()
     if args.profile=='full':
         trials=args.trials or 30
@@ -47,7 +48,7 @@ def main() -> int:
     if args.require_chain and backend!='anvil':
         parser.error('live contract required: compile/deploy and configure PABLA_CONTRACT')
     options=Options(profile=args.profile,seed=args.seed,trials=trials,event_count=count,
-                    batch_size=args.batch_size,backend=backend,rpc=args.rpc,contract_address=args.address)
+                    batch_size=args.batch_size,backend=backend,rpc=args.rpc,contract_address=args.address,dataset_path=args.dataset_path)
     # Validate actual chain before allocating output/testN.
     check=ledger_for(options)
     run=new_run(args.output)

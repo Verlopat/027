@@ -57,11 +57,20 @@ def aggregate(suite: dict[str,list[dict]], run: Path) -> dict:
                           'cases':len(rows),'detected':k,'coverage':k/len(rows),
                           'inference':'deterministic observed test cases, no binomial CI or p-value',
                           'is_valid_case':attack=='NONE'})
-    summary={'detection':detection,'timings':{},'paired_tests':[]}
-    for exp in ('e3_overhead','e4_tradeoff','e7_stability'):
+    e9 = [r for r in suite.get('e9_key_compromise',[]) if r.get('attack')]
+    e10 = suite.get('e10_exposure',[])
+    e11 = suite.get('e11_cost_frontier',[])
+    e12 = suite.get('e12_public_replay',[])
+    summary={'detection':detection,'timings':{},'paired_tests':[],
+             'fi_attack_matrix':e9,'fi_exposure':e10,'fi_cost_frontier':e11,
+             'public_replay':e12}
+    _write_table(run/'results'/'derived'/'fi_security_matrix.csv',e9)
+    _write_table(run/'results'/'derived'/'fi_exposure.csv',e10)
+    _write_table(run/'results'/'derived'/'fi_cost_frontier.csv',e11)
+    for exp in ('e3_overhead','e4_tradeoff','e7_stability','e8_ct_history_comparison','e11_cost_frontier'):
         values=defaultdict(list)
         for row in suite.get(exp,[]):
-            for key in ('build_ns_per_event','verify_ns_per_event','elapsed_ns','tx_per_event'):
+            for key in ('build_ns_per_event','verify_ns_per_event','construction_ns_per_event','verification_ns_per_event','anchor_ns_per_event','gas_per_event','elapsed_ns','tx_per_event'):
                 if isinstance(row.get(key),(int,float)):
                     values[(row['method'],key)].append(row[key])
         for (method,key),sample in values.items():
@@ -84,7 +93,7 @@ def _write_table(path: Path, rows: list[dict]) -> None:
     if not rows:
         return
     with path.open('w', newline='',encoding='utf8') as f:
-        writer=csv.DictWriter(f,fieldnames=list(rows[0]))
+        writer=csv.DictWriter(f,fieldnames=list(dict.fromkeys(k for row in rows for k in row)))
         writer.writeheader()
         writer.writerows(rows)
 
@@ -129,5 +138,58 @@ def figures(run: Path, summary: dict) -> list[str]:
         fig.tight_layout()
         for ext in ('svg','pdf'):
             output=run/'figures'/f'F2_anchors.{ext}';fig.savefig(output);outputs.append(str(output))
+        plt.close(fig)
+    fi=summary.get('fi_attack_matrix',[])
+    attack='REWRITE_PREVIOUS_SIGNED_PENDING_PERIOD'
+    selected=[r for r in fi if r.get('attack')==attack]
+    if selected:
+        groups=defaultdict(list)
+        for r in selected:groups[r['method']].append(int(r['accepted']))
+        labels=sorted(groups)
+        fractions=[statistics.mean(groups[m]) for m in labels]
+        fig,ax=plt.subplots(figsize=(9,4))
+        ax.bar(labels,fractions)
+        ax.set_ylim(0,1.05)
+        ax.set_ylabel('Accepted forged pending archives / executed cases')
+        ax.set_title('E9 previously signed, unanchored period after key theft')
+        fig.tight_layout()
+        for ext in ('svg','pdf'):
+            output=run/'figures'/f'F9_forward_integrity.{ext}'
+            fig.savefig(output);outputs.append(str(output))
+        plt.close(fig)
+    exposure=summary.get('fi_exposure',[])
+    if exposure:
+        fig,ax=plt.subplots(figsize=(6,5))
+        ax.scatter([r['modelled_exposed_events'] for r in exposure],
+                   [r['observed_exposed_events'] for r in exposure])
+        maximum=max([r['modelled_exposed_events'] for r in exposure]+[1])
+        ax.plot([0,maximum],[0,maximum],linestyle='--')
+        ax.set_xlabel('Modelled exposed events')
+        ax.set_ylabel('Computed exposed events')
+        ax.set_title('E10 simulated exposure model validation')
+        fig.tight_layout()
+        for ext in ('svg','pdf'):
+            output=run/'figures'/f'F10_exposure.{ext}'
+            fig.savefig(output);outputs.append(str(output))
+        plt.close(fig)
+    frontier=summary.get('fi_cost_frontier',[])
+    if frontier:
+        # Transaction calls are measured in both adapters. EVM gas is shown
+        # only when every plotted row contains an actual gas receipt.
+        has_gas=all(isinstance(r.get('gas_per_event'),(int,float)) for r in frontier)
+        y='gas_per_event' if has_gas else 'anchor_calls_per_event'
+        fig,ax=plt.subplots(figsize=(7,5))
+        for mode in sorted({r['mode'] for r in frontier}):
+            series=[r for r in frontier if r['mode']==mode]
+            ax.scatter([r['observed_max_wait_ms'] for r in series],
+                       [r[y] for r in series],label=mode)
+        ax.set_xlabel('Maximum simulated event-to-anchor wait (ms)')
+        ax.set_ylabel('Measured gas per event' if has_gas else 'Executed anchor calls per event (not gas)')
+        ax.set_title('E11 observed cost–exposure points')
+        ax.legend()
+        fig.tight_layout()
+        for ext in ('svg','pdf'):
+            output=run/'figures'/f'F11_cost_frontier.{ext}'
+            fig.savefig(output);outputs.append(str(output))
         plt.close(fig)
     return outputs

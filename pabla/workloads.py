@@ -57,29 +57,92 @@ def attack_batch(batch: Batch, attack: str, *, seed: int = 0) -> Batch | None:
     return copied
 
 
-def adaptive_attack_batch(batch: Batch, attack: str, policy: Policy) -> Batch:
-    """Adaptive archive attacker: regenerate all *unprotected* commitments.
+def rebuild_untrusted(batch: Batch, policy: Policy) -> Batch:
+    """Recompute all public fields after tampering, never forge a protected signature.
 
-    No legitimate signing key or ledger-submission credential is assumed.
-    Hash-chain and Merkle computations are public, not authentication.
+    Unlike a naive mutation, an unsigned attacker can rewrite range/count
+    metadata. Changes after a batch boundary need history-level recomputation.
     """
-    modified = attack_batch(batch, attack)
+    from .protocol import ProtocolError
+    copy_batch=copy.deepcopy(batch)
+    m=copy_batch.manifest
+    if not copy_batch.events:
+        raise ProtocolError('empty archive cannot be represented as a batch')
+    m['event_count']=len(copy_batch.events)
+    m['last_sequence']=m['first_sequence']+len(copy_batch.events)-1
+    prev=m['first_previous_chain'] if policy.chain else '00'*32
+    leaves=[]
+    for i,ev in enumerate(copy_batch.events):
+        seq=m['first_sequence']+i
+        evhash=event_hash(m['collector_id'],m['epoch'],seq,ev)
+        prev=chain_hash(m['collector_id'],m['epoch'],seq,prev,evhash) if policy.chain else '00'*32
+        leaves.append(leaf_hash(seq,evhash,prev))
+    m['merkle_root']=merkle_root(leaves)
+    m['last_chain']=prev if policy.chain else '00'*32
+    copy_batch.leaves=leaves
+    copy_batch.manifest_digest=manifest_hash(m)
+    return copy_batch
+
+
+def adaptive_attack_batch(batch: Batch, attack: str, policy: Policy) -> Batch:
+    """Adaptive archive attacker without the collector signing key.
+
+    AT8 must be a REAL substitution, never an honest-batch no-op. Any attack
+    that accidentally leaves the artifact unchanged causes the trial to fail.
+    """
+    modified=attack_batch(batch,attack)
     if modified is None:
-        raise ValueError("archive deletion is not a modified batch")
-    m = modified.manifest
-    if len(modified.events) != m['event_count']:
-        # Structural continuity attacks cannot be hidden by merely hashing again.
-        return modified
-    prev = m['first_previous_chain'] if policy.chain else '00' * 32
-    leaves = []
-    for i, ev in enumerate(modified.events):
-        seq = m['first_sequence'] + i
-        evhash = event_hash(m['collector_id'], m['epoch'], seq, ev)
-        prev = chain_hash(m['collector_id'], m['epoch'], seq, prev, evhash) if policy.chain else '00' * 32
-        leaves.append(leaf_hash(seq, evhash, prev))
-    m['merkle_root'] = merkle_root(leaves)
-    m['last_chain'] = prev if policy.chain else '00' * 32
-    modified.leaves = leaves
-    modified.manifest_digest = manifest_hash(m)
-    # The old signature deliberately remains: an attacker without the key cannot re-sign.
-    return modified
+        raise ValueError('archive deletion requires history-level attack')
+    if attack=='AT8':
+        # Substitute a genuinely different event set, then compute its root.
+        # The public Merkle computation is possible without knowing the key;
+        # the ORIGINAL signature is deliberately retained and thus invalid.
+        modified.events[0]['payload']['pid'] += 17
+    result=rebuild_untrusted(modified,policy)
+    if canonical(result.export()) == canonical(batch.export()):
+        raise AssertionError(f'adaptive attack {attack} produced an unchanged artifact')
+    return result
+
+
+def adaptive_reissue_history(batches: list[Batch], policy: Policy, attack: str) -> list[Batch]:
+    """Re-issue complete unsigned histories after modification.
+
+    This models the strongest no-key attacker for B3: hashes and apparent
+    sequence numbers are fully rewritten. It cannot defeat signed checkpoints
+    or immutable anchors and must not be used to claim it can.
+    """
+    if not batches:
+        raise ValueError('need history')
+    from .protocol import Collector, keypair
+    source=[copy.deepcopy(b.events) for b in batches]
+    if attack=='MIDDLE_BATCH_DELETE':
+        if len(source)<3: raise ValueError('need three batches')
+        source.pop(1)
+    elif attack=='TAIL_TRUNCATION':
+        if len(source)<2: raise ValueError('need two batches')
+        source.pop()
+    elif attack=='BATCH_REORDER':
+        if len(source)<3: raise ValueError('need three batches')
+        source[1],source[2]=source[2],source[1]
+    elif attack=='CROSS_BATCH_SPLICE':
+        if len(source)<3: raise ValueError('need three batches')
+        source[1][-1],source[2][0]=source[2][0],source[1][-1]
+        # A contiguous resubmission must respect each batch's monotonic order;
+        # an adaptive untrusted attacker may reassign local monotonic counters.
+    elif attack=='AT2':
+        source[0].pop(len(source[0])//2)
+    elif attack=='AT4':
+        original=copy.deepcopy(source[0][0]);original['event_id']=digest('REISSUED-EVENT-ID', original['event_id'])
+        source[0].insert(1,original)
+    else:
+        raise ValueError(f'unsupported adaptive history attack {attack}')
+    sk,_=keypair()
+    fake=Collector(batches[0].manifest['collector_id'],batches[0].manifest['epoch'],sk,policy)
+    output=[]
+    monotonic_counter=1
+    for evs in source:
+        for ev in evs:
+            ev['collector_monotonic_ns']=monotonic_counter
+            monotonic_counter+=1
+        output.append(fake.collect(evs))
+    return output

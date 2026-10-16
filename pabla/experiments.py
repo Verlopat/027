@@ -21,7 +21,7 @@ from typing import Any
 from .ledger import InMemoryLedger
 from .protocol import Collector, Policy, ProtocolError, Batch, keypair, manifest_hash, sign, utc_now, verify_batch, verify_history, verify_complete_history
 from .storage import RunIndex, archive_size, manifest_metadata, save_batch, write_json, write_jsonl
-from .workloads import attack_batch, adaptive_attack_batch, generate_events
+from .workloads import attack_batch, adaptive_attack_batch, adaptive_reissue_history, generate_events
 
 METHODS = ('P1','B1','B2','B3','B4','A1','A2','A3','A4','A5')
 ATTACKS = ('AT1','AT2','AT3','AT4','AT5','AT6','AT7','AT8','AT9','AT10', 'TAIL_TRUNCATION', 'MIDDLE_BATCH_DELETE', 'BATCH_REORDER', 'CROSS_BATCH_SPLICE', 'FORK')
@@ -39,6 +39,7 @@ class Options:
     contract_address: str = ''
     abi_path: str = 'contracts/out/CollectorAnchorRegistry.sol/CollectorAnchorRegistry.json'
     base_timestamp: str = ''
+    dataset_path: str = ''
 
 
 _ANVIL_SNAPSHOT: dict[str, Any] = {}
@@ -91,9 +92,16 @@ def _make(options: Options, method: str, seed: int, count: int, batch_size: int,
         # The payload generator seed remains paired across comparison methods.
         collector_id = f'trial-{time.time_ns()}-{method}'
     sk, pk = keypair()
-    ledger.register(collector_id, epoch, pk, policy_name=method)
     policy = Policy.for_name(method)
-    collector = Collector(collector_id, epoch, sk, policy)
+    if policy.forward_integrity:
+        from .keyschedule import EvolvingSigner
+        schedule=EvolvingSigner.create(count=min(10000, max(4, (count+batch_size-1)//batch_size+2)))
+        schedule.retain_old_for_ablation=(method=="FI-noerase")
+        ledger.register_fi(collector_id,epoch,schedule.root,schedule.count,policy_name=method)
+        collector=Collector(collector_id,epoch,sk,policy,evolving=schedule)
+    else:
+        ledger.register(collector_id, epoch, pk, policy_name=method)
+        collector = Collector(collector_id, epoch, sk, policy)
     if events is None:
         events = generate_events(count, seed, collector_id, epoch, timestamp=options.base_timestamp)
     batches: list[Batch] = []
@@ -190,6 +198,23 @@ def continuity(options: Options) -> list[dict]:
                         v = verify_batch(changed,l,policy=c.policy)
                 rows.append(_row('E2',method,trial,l,attack=attack,attacker_model='naive',verdict=v.status,
                                  anomalies=';'.join(v.anomalies),detected=int(_record_status(v)),valid_case=False))
+                if attack in ('AT2','AT4'):
+                    if method == 'B3':
+                        revised=adaptive_reissue_history(bs,c.policy,attack)
+                        adv=verify_history(revised,l,c.policy)
+                        v_ad=next((q for q in adv if _record_status(q)),adv[-1])
+                        detected_ad=int(any(_record_status(q) for q in adv))
+                    elif method == 'B1':
+                        mutated=None if attack=='AT2' else adaptive_attack_batch(bs[0],attack,c.policy)
+                        v_ad=verify_batch(mutated,l,policy=c.policy)
+                        detected_ad=int(_record_status(v_ad))
+                    else:
+                        mutated=adaptive_attack_batch(bs[0],attack,c.policy)
+                        v_ad=verify_batch(mutated,l,policy=c.policy)
+                        detected_ad=int(_record_status(v_ad))
+                    rows.append(_row('E2',method,trial,l,attack=attack,attacker_model='adaptive',
+                                     verdict=v_ad.status,anomalies=';'.join(v_ad.anomalies),
+                                     detected=detected_ad,valid_case=False))
             if len(bs)>2 and method != 'B1':
                 for history_attack in ('MIDDLE_BATCH_DELETE','BATCH_REORDER','CROSS_BATCH_SPLICE','FORK'):
                     history=copy.deepcopy(bs)
@@ -223,6 +248,15 @@ def continuity(options: Options) -> list[dict]:
                                      attacker_model='history-attack' if history_attack!='FORK' else 'authorized-key-fork',
                                      verdict=v.status,anomalies=';'.join(v.anomalies),
                                      detected=int(detected),valid_case=False))
+                    if method=='B3' and history_attack!='FORK':
+                        reconstructed=adaptive_reissue_history(bs,c.policy,history_attack)
+                        adaptive_verdicts=verify_history(reconstructed,l,c.policy)
+                        av=next((q for q in adaptive_verdicts if _record_status(q)),adaptive_verdicts[-1])
+                        rows.append(_row('E2',method,trial,l,attack=history_attack,
+                                         attacker_model='adaptive',verdict=av.status,
+                                         anomalies=';'.join(av.anomalies),
+                                         detected=int(any(_record_status(q) for q in adaptive_verdicts)),
+                                         valid_case=False))
             honest = verify_history(bs,l,c.policy)
             # Tail truncation must be assessed against the *trusted ledger tip*.
             if method in ('P1','B1','B4','A1','A2') and len(bs)>1:
@@ -239,7 +273,7 @@ def continuity(options: Options) -> list[dict]:
 def overhead(options: Options) -> list[dict]:
     rows = []
     for trial in range(options.trials):
-        methods=list(('P1','B1','B2','B3','B4'))
+        methods=list(('P1','B1','B2','B3','B4','FI'))
         random.Random(options.seed+trial).shuffle(methods)
         for method in methods:
             count = min(options.event_count, 250 if method == 'B1' and options.profile != 'full' else 10_000)
@@ -275,14 +309,20 @@ def tradeoff(options: Options) -> list[dict]:
             for rate in rates:
                 count = options.event_count if options.profile=='full' else min(options.event_count,24)
                 bs=min(requested_bs,count)
-                methods = ['P1','B4']
+                methods = ['P1','B4','FI']
                 random.Random(options.seed + trial + rate + bs).shuffle(methods)
                 for method in methods:
                     ledger=ledger_for(options)
                     identifier = f'e4-{time.time_ns()}-{method}' if options.backend=='anvil' else 'e4-collector'
                     sk,pk=keypair()
-                    ledger.register(identifier,1,pk,policy_name=method)
-                    collector=Collector(identifier,1,sk,Policy.for_name(method))
+                    if method=='FI':
+                        from .keyschedule import EvolvingSigner
+                        schedule=EvolvingSigner.create(count=min(10000,(count+bs-1)//bs+2))
+                        ledger.register_fi(identifier,1,schedule.root,schedule.count)
+                        collector=Collector(identifier,1,sk,Policy.for_name(method),evolving=schedule)
+                    else:
+                        ledger.register(identifier,1,pk,policy_name=method)
+                        collector=Collector(identifier,1,sk,Policy.for_name(method))
                     events=generate_events(count,options.seed+trial,identifier,1,timestamp=options.base_timestamp or utc_now())
                     pending=[];arrivals=[];delays=[];build_ns=0;verify_ns=0;anchor_ns=0;receipts=[]
                     start=time.perf_counter()
@@ -423,7 +463,7 @@ def ct_history_comparison(options: Options) -> list[dict]:
     """
     import copy
     from .ct_baseline import CTBaseline, leaf as ct_leaf, root as ct_root, inclusion_proof, verify_inclusion, consistency_proof, verify_consistency
-    from .protocol import canonical
+    from .protocol import canonical, digest
     rows=[]
     for trial in range(options.trials):
         count=min(options.event_count, 1000)
@@ -431,9 +471,11 @@ def ct_history_comparison(options: Options) -> list[dict]:
                                                     min(options.batch_size,count))
         events=[ev for b in bs for ev in b.events]
         correct=verify_complete_history(bs,l,policy=c.policy,collector_id=c.collector_id,epoch=c.epoch)
-        rows.append(_row('E8','P1',trial,l,events=count,
+        rows.append(_row('E8','P1',trial,l,events=count,scenario='benchmark',
                          all_valid=int(all(v.status=='ACCEPT' for v in correct)),
                          verification_ns=verify_ns,construction_ns=build_ns,
+                         construction_ns_per_event=build_ns/count,
+                         verification_ns_per_event=verify_ns/count,
                          trust_model='registered collector and ledger anchored batches',
                          input_fingerprint=digest_events(events)))
         ct=CTBaseline(c.private_key)
@@ -466,14 +508,64 @@ def ct_history_comparison(options: Options) -> list[dict]:
         detects_tamper=not verify_inclusion(ct_leaf(canonical(altered)),audit_index,len(events),inclusion,
                                            bytes.fromhex(last_checkpoint['root']))
         verification_ns=time.perf_counter_ns()-tv
-        rows.append(_row('E8','CT_HISTORY_TREE_REFERENCE',trial,l,events=count,
+        rows.append(_row('E8','CT_HISTORY_TREE_REFERENCE',trial,l,events=count,scenario='benchmark',
                          all_valid=int(all_valid),detects_postcommit_tamper=int(detects_tamper),
                          consistency_comparisons=len(comparisons),
-                         proof_bytes=sum(len(p)*32 for _,_,pp in comparisons for p in [pp]),
+                         proof_bytes=sum(len(pp)*32 for _,_,pp in comparisons),
                          construction_ns=constructed_ns,verification_ns=verification_ns,
+                         construction_ns_per_event=constructed_ns/count,
+                         verification_ns_per_event=verification_ns/count,
+                         verification_ns_per_inclusion_proof=verification_ns,
                          trust_model='signed transparency-tree checkpoints, no ledger anchoring',
                          input_fingerprint=digest_events(events),
                          performance_claim='reference implementation, not optimized or production throughput'))
+        # Matched-trust reference: anchor the signed CT checkpoint root via the
+        # same local contract, using an opaque CT-root commitment. The CT signature
+        # and append-only verification remain independent of PABLA's verifier.
+        ctledger=ledger_for(options)
+        ct_id=f'ct-e8-{time.time_ns()}-{trial}' if options.backend=='anvil' else f'ct-e8-{trial}'
+        ctledger.register(ct_id,1,ct.public_key,policy_name='B4')
+        mh=digest('PABLA-CT-ANCHOR-v1',canonical(last_checkpoint))
+        anchor_obj=Batch({'collector_id':ct_id,'epoch':1,'batch_number':1,'method':'B4',
+                          'first_sequence':1,'last_sequence':count,
+                          'merkle_root':last_checkpoint['root'],'last_chain':'00'*32,
+                          'previous_manifest_hash':'00'*32},last_checkpoint['signature'],[],mh,[])
+        anchor_receipt=ctledger.anchor(anchor_obj)
+        rows.append(_row('E8','CT_ANCHORED',trial,ctledger,events=count,scenario='benchmark',
+            all_valid=int(all_valid),construction_ns_per_event=constructed_ns/count,
+            verification_ns_per_event=verification_ns/count,
+            transactions=1,gas_used=anchor_receipt.get('gas_used'),
+            trust_model='signed CT checkpoint independently anchored on identical contract',
+            input_fingerprint=digest_events(events)))
+        for attack in ('AT1','AT2','AT3','AT4'):
+            for model in ('naive','adaptive-stolen-key'):
+                # Identical event mutations for the compared methods.
+                altered=copy.deepcopy(events)
+                if attack=='AT1': altered[0]['payload']['pid']+=10
+                elif attack=='AT2': altered.pop(len(altered)//2)
+                elif attack=='AT3': altered[0],altered[-1]=altered[-1],altered[0]
+                elif attack=='AT4': altered.insert(1,copy.deepcopy(altered[0]))
+                candidate=CTBaseline(ct.signing_key)
+                for ev in altered: candidate.append(ev)
+                forged_cp=candidate.checkpoint()
+                # Naive attacker supplies unchanged signed checkpoint, not new signature.
+                proposed=last_checkpoint if model=='naive' else forged_cp
+                archive_consistent=(proposed['size']==len(altered) and proposed['root']==ct_root(candidate.hashes).hex())
+                signature_valid=CTBaseline.verify_checkpoint(proposed,ct.public_key)
+                anchor_consistent=proposed['root']==last_checkpoint['root'] and proposed['size']==count
+                for ct_method in ('CT_HISTORY_TREE_REFERENCE','CT_ANCHORED'):
+                    detected=not (archive_consistent and signature_valid and (ct_method!='CT_ANCHORED' or anchor_consistent))
+                    rows.append(_row('E8',ct_method,trial,ctledger if ct_method=='CT_ANCHORED' else l,
+                        events=count,scenario='attack',attack=attack,attacker_model=model,
+                        detected=int(detected),verdict='REJECT' if detected else 'ACCEPT',
+                        trust_model='anchored CT root' if ct_method=='CT_ANCHORED' else 'offchain static-key CT'))
+                p1mut=attack_batch(bs[0],attack) if model=='naive' else adaptive_attack_batch(bs[0],attack,c.policy)
+                if model!='naive':
+                    p1mut.signature=sign(c.private_key,p1mut.manifest_digest)
+                pv=verify_batch(p1mut,l,policy=c.policy)
+                rows.append(_row('E8','P1',trial,l,events=count,scenario='attack',attack=attack,
+                    attacker_model=model,detected=int(_record_status(pv)),verdict=pv.status,
+                    trust_model='registered collector and anchored batch'))
     return rows
 
 def digest_events(events: list[dict]) -> str:
@@ -485,6 +577,205 @@ def digest_events(events: list[dict]) -> str:
         h.update(len(encoded).to_bytes(8,'big'))
         h.update(encoded)
     return h.hexdigest()
+
+
+def fi_compromise(options: Options) -> list[dict]:
+    """E9: compare previously signed unanchored periods AFTER key theft.
+
+    Static signatures and anchors BOTH protect earlier anchored history, so
+    the precise differential is period-key erasure for an unanchored signed
+    archive. Without independent custody, these archives can still vanish.
+    """
+    from .protocol import verify_pending_batch, verify_batch, public_hex
+    from .keyschedule import EvolvingSigner, private_from_seed
+    from .workloads import rebuild_untrusted
+    from .ct_baseline import CTBaseline
+    rows=[]
+    n=max(2,min(options.batch_size,24))
+    for trial in range(options.trials):
+        for method in ('FI','FI-noerase','FI-nochain','P1','B4'):
+            ledger=ledger_for(options)
+            collector_id=f'e9-{method}-{trial}-{time.time_ns()}' if options.backend=='anvil' else f'e9-{method}-{trial}'
+            sk,pk=keypair()
+            policy=Policy.for_name(method)
+            evolving=None
+            if policy.forward_integrity:
+                evolving=EvolvingSigner.create(count=8)
+                evolving.retain_old_for_ablation=method=='FI-noerase'
+                ledger.register_fi(collector_id,1,evolving.root,evolving.count,policy_name=method)
+            else:
+                ledger.register(collector_id,1,pk,policy_name=method)
+            c=Collector(collector_id,1,sk,policy,evolving=evolving)
+            stream=generate_events(3*n,options.seed+trial,collector_id,1,timestamp=options.base_timestamp or utc_now())
+            b1=c.collect(stream[:n]); ledger.anchor(b1)
+            b2=c.collect(stream[n:2*n])  # signed, pending, NOT YET anchored
+            current_seed=evolving.compromised_current_seed_for_test() if evolving else None
+            prior_seed=(evolving.historical_seeds.get(2) if method=='FI-noerase' else None) if evolving else None
+            forged=copy.deepcopy(b2)
+            forged.events[0]['payload']['pid']+=351
+            forged=rebuild_untrusted(forged,policy)
+            attacker_sk=(private_from_seed(prior_seed or current_seed) if evolving else sk)
+            forged.signature=sign(attacker_sk,forged.manifest_digest)
+            result=verify_pending_batch(forged,ledger,policy=policy,previous=b1.manifest)
+            rows.append(_row('E9',method,trial,ledger,attack='REWRITE_PREVIOUS_SIGNED_PENDING_PERIOD',
+                 attacker_model='stolen-current-key',accepted=int(result.status=='ACCEPT_WITH_WARNING'),
+                 verdict=result.status,anomalies=';'.join(result.anomalies),period=2,
+                 claim='previously signed but not independently anchored',trust_model='registered signer and schedule'))
+            anchored=copy.deepcopy(b1)
+            anchored.events[0]['payload']['pid']+=278
+            anchored=rebuild_untrusted(anchored,policy)
+            # Any active-key compromise still cannot alter immutable anchor.
+            anchored.signature=sign(attacker_sk,anchored.manifest_digest)
+            v=verify_batch(anchored,ledger,policy=policy)
+            rows.append(_row('E9',method,trial,ledger,attack='REWRITE_ALREADY_ANCHORED',
+                attacker_model='stolen-current-key',accepted=int(v.status=='ACCEPT'),verdict=v.status,
+                anomalies=';'.join(v.anomalies),period=1,
+                claim='all models must reject anchored substitutions'))
+            if policy.forward_integrity:
+                # Attacker cannot relabel the stolen future/current key as past.
+                stale=copy.deepcopy(b2)
+                stale.manifest['period']=1
+                stale.manifest_digest=manifest_hash(stale.manifest)
+                stale.signature=sign(attacker_sk,stale.manifest_digest)
+                rejected=verify_pending_batch(stale,ledger,policy=policy,previous=b1.manifest)
+                rows.append(_row('E9',method,trial,ledger,attack='EARLIER_PERIOD_WITH_STOLEN_KEY',
+                    attacker_model='adaptive-stolen-key',accepted=int(rejected.status=='ACCEPT_WITH_WARNING'),
+                    verdict=rejected.status,anomalies=';'.join(rejected.anomalies),period=1))
+                # A collector thief can use CURRENT key to sign fabricated
+                # future-period content. FI does not solve semantic truth.
+                ledger.anchor(b2)
+                fabricated=copy.deepcopy(stream[2*n:])
+                fabricated[0]['payload']['process']='fabricated-after-compromise'
+                b3=c.collect(fabricated)
+                ledger.anchor(b3)
+                v3=verify_batch(b3,ledger,policy=policy,previous=b2.manifest)
+                rows.append(_row('E9',method,trial,ledger,attack='FABRICATE_WITH_CURRENT_KEY',
+                    attacker_model='adaptive-stolen-key',accepted=int(v3.status=='ACCEPT'),
+                    verdict=v3.status,anomalies=';'.join(v3.anomalies),period=3,
+                    ground_truth='semantically fabricated, cryptographically valid'))
+        # CT-style unanchored checkpoints: a compromised STATIC key can sign a
+        # new checkpoint for rewritten logs. Anchored roots reject the rewrite.
+        for anchored in (False,True):
+            sk,pk=keypair()
+            ct=CTBaseline(sk)
+            events=generate_events(2*n,options.seed+trial,'ct-trial')
+            for event in events: ct.append(event)
+            honest=ct.checkpoint()
+            changed=copy.deepcopy(events)
+            changed[0]['payload']['pid']+=12
+            attacker=CTBaseline(sk)
+            for event in changed: attacker.append(event)
+            forged=attacker.checkpoint()
+            accepted=ct.verify_checkpoint(forged,ct.public_key) and (
+                not anchored or forged['root']==honest['root'])
+            rows.append(_row('E9','CT_ANCHORED' if anchored else 'CT_OFFCHAIN',trial,
+                type('Backend',(),{'backend':'checkpoint-reference' if not anchored else 'anchored-root-comparison'})(),
+                attack='REWRITE_CHECKPOINT_WITH_STOLEN_KEY',attacker_model='adaptive-stolen-key',
+                accepted=int(accepted),verdict='ACCEPT' if accepted else 'REJECT_CHECKPOINT',
+                trust_model='signed checkpoint + independently anchored root' if anchored else 'signed checkpoint only',
+                warning='anchored variant compares recorded root, not measured EVM gas'))
+        from .keychain_baseline import issue_chain,verify_chain
+        initial,links,_=issue_chain(bytes([trial%256])*32,3)
+        rows.append(_row('E9','KEYCHAIN_REFERENCE',trial,
+            type('Backend',(),{'backend':'offchain-reference'})(),
+            attack='MISSING_TRANSITION',attacker_model='archive-suppression',
+            accepted=int(verify_chain(initial,links[:1]+links[2:])),
+            verdict='ACCEPT' if verify_chain(initial,links[:1]+links[2:]) else 'REJECT_LINK',
+            trust_model='initial signing public key and complete transition archive'))
+    return rows
+
+
+def fi_exposure(options: Options) -> list[dict]:
+    """E10: exact event-exposure counts at controlled compromise times."""
+    from .anchoring import windows,exposed_events,exposed_interval_ms
+    rows=[]
+    for trial in range(options.trials):
+        rng=random.Random(options.seed+trial)
+        count=min(options.event_count,10000)
+        rates=(10,100,1000,10000)
+        rate=rates[trial%len(rates)]
+        # Synthetic burstiness, not measured public traffic.
+        arrivals=[];t=0
+        for i in range(count):
+            t+=rng.choice((0,0,1,max(1,1000//rate),max(1,4000//rate)))
+            arrivals.append(t)
+        for bound in (50,100,500,1000):
+            batches=windows(arrivals,batch_size=options.batch_size,max_dwell_ms=1000,max_exposure_ms=bound)
+            compromise=rng.randrange(0,arrivals[-1]+2)
+            measured=exposed_events(arrivals,batches,compromise)
+            anchor_finish=max((w.confirmed_ms for w in batches if w.confirmed_ms < compromise),default=-1)
+            independently_modelled=sum(1 for a in arrivals if anchor_finish<a<=compromise)
+            if measured!=independently_modelled: raise AssertionError('E10 exposure model mismatch')
+            rows.append(_row('E10','FI',trial,type('Backend',(),{'backend':'synthetic-model'})(),
+                event_rate_nominal=rate,events=count,window_max_ms=bound,
+                compromise_ms=compromise,observed_exposed_events=measured,
+                modelled_exposed_events=independently_modelled,
+                exposure_window_ms=exposed_interval_ms(batches,compromise),
+                anchors=len(batches),trace_source='seeded synthetic timing'))
+    return rows
+
+
+def fi_frontier(options: Options) -> list[dict]:
+    """E11: actual in-memory / EVM anchor calls; gas null unless receipt measured."""
+    from .anchoring import windows
+    from .keyschedule import EvolvingSigner
+    rows=[]
+    count=min(options.event_count,10000)
+    for trial in range(options.trials):
+        rng=random.Random(options.seed+trial+1029)
+        arrivals=[];t=0
+        for i in range(count):
+            t+=rng.choice((0,1,3,10,50))
+            arrivals.append(t)
+        for bound in (50,200,1000):
+            for mode in ('fixed','adaptive'):
+                batches=windows(arrivals,batch_size=min(options.batch_size,count),max_dwell_ms=1000,
+                                max_exposure_ms=bound,mode=mode,fixed_interval_ms=bound if mode=='fixed' else None)
+                ledger=ledger_for(options)
+                collector_id=f'frontier-{trial}-{bound}-{mode}-{time.time_ns()}' if options.backend=='anvil' else f'frontier-{trial}-{bound}-{mode}'
+                sk,pk=keypair()
+                schedule=EvolvingSigner.create(count=min(10000,len(batches)+1))
+                ledger.register_fi(collector_id,1,schedule.root,schedule.count)
+                collector=Collector(collector_id,1,sk,Policy.for_name('FI'),evolving=schedule)
+                data=generate_events(count,options.seed+trial,collector_id,1,timestamp=options.base_timestamp or utc_now())
+                receipt_gas=[];built_ns=0;anchored_ns=0
+                for w in batches:
+                    started=time.perf_counter_ns()
+                    batch=collector.collect(data[w.first_index:w.last_index+1])
+                    built_ns+=time.perf_counter_ns()-started
+                    started=time.perf_counter_ns()
+                    rec=ledger.anchor(batch)
+                    anchored_ns+=time.perf_counter_ns()-started
+                    if 'gas_used' in rec:receipt_gas.append(rec['gas_used'])
+                max_delay=max(w.max_wait_ms for w in batches)
+                rows.append(_row('E11','FI',trial,ledger,mode=mode,events=count,bound_ms=bound,
+                    anchors=len(batches),anchor_calls_per_event=len(batches)/count,
+                    observed_max_wait_ms=max_delay,
+                    violates_bound=int(max_delay>bound),
+                    construction_ns_per_event=built_ns/count,anchor_ns_per_event=anchored_ns/count,
+                    gas_per_event=sum(receipt_gas)/count if len(receipt_gas)==len(batches) else None,
+                    gas_source='measured Anvil receipt' if receipt_gas else 'unavailable on in-memory test double'))
+    return rows
+
+
+def fi_public_replay(options: Options) -> list[dict]:
+    """E12 only reports real source observations when the dataset is supplied."""
+    from .datasets import replay_times
+    from .anchoring import windows
+    if not options.dataset_path:
+        return [_row('E12','FI',0,type('Backend',(),{'backend':'not-run'})(),
+                     status='SKIPPED_NO_PUBLIC_DATASET',events=None,source=None,
+                     explanation='Supply --dataset-path with independently obtained LANL CSV/gz/bz2')]
+    arrivals,sizes,checksum=replay_times(options.dataset_path,max_events=min(options.event_count,100000))
+    rows=[]
+    for bound in (1000,5000,10000):
+        w=windows(arrivals,batch_size=options.batch_size,max_dwell_ms=5000,max_exposure_ms=bound)
+        rows.append(_row('E12','FI',0,type('Backend',(),{'backend':'trace-replay-model'})(),
+            status='EXECUTED',events=len(arrivals),source=options.dataset_path,
+            source_sha256=checksum,source_bytes=sum(sizes),window_max_ms=bound,
+            anchors=len(w),max_wait_ms=max(x.max_wait_ms for x in w),
+            note='arrival-time replay only; no EVM gas unless separately run'))
+    return rows
 
 
 def save_rows(run: Path, name: str, rows: list[dict]) -> None:
@@ -523,7 +814,9 @@ def run_all(run: Path, options: Options) -> dict[str, list[dict]]:
     for title,fn in (('e1_integrity',integrity),('e2_continuity',continuity),
                      ('e3_overhead',overhead),('e4_tradeoff',tradeoff),
                      ('e5_recovery',recovery),('e6_residual_risk',residual),
-                     ('e7_stability',stability),('e8_ct_history_comparison',ct_history_comparison)):
+                     ('e7_stability',stability),('e8_ct_history_comparison',ct_history_comparison),
+                     ('e9_key_compromise',fi_compromise),('e10_exposure',fi_exposure),
+                     ('e11_cost_frontier',fi_frontier),('e12_public_replay',fi_public_replay)):
         t0=time.perf_counter_ns()
         try:
             rows=fn(options)

@@ -35,6 +35,14 @@ contract CollectorAnchorRegistry {
     mapping(bytes32 => mapping(uint64 => uint64)) public latestBatch;
     mapping(bytes32 => mapping(uint64 => uint64)) public latestSequence;
 
+    struct FISchedule { bytes32 root; uint64 start; uint64 count; }
+    struct FIAnchor { uint64 period; bytes32 scheduleRoot; }
+    mapping(bytes32 => mapping(uint64 => FISchedule[])) internal fiSchedules;
+    mapping(bytes32 => mapping(uint64 => mapping(uint64 => FIAnchor))) internal fiAnchors;
+    mapping(bytes32 => mapping(uint64 => uint64)) public latestPeriod;
+    event FIScheduleRegistered(bytes32 indexed collector, uint64 indexed epoch, bytes32 root, uint64 firstPeriod, uint64 count);
+
+
     event Registered(bytes32 indexed collector, uint64 indexed epoch, bytes32 publicKey, bytes32 recoveryCommitment, bytes32 policyId);
     event Revoked(bytes32 indexed collector, uint64 indexed epoch, uint64 revocationBlock);
     event Anchored(bytes32 indexed collector, uint64 indexed epoch, uint64 indexed batchNumber, bytes32 manifestHash, bytes32 root);
@@ -53,6 +61,46 @@ contract CollectorAnchorRegistry {
         emit Registered(collector, epoch, publicKey, recoveryCommitment, policyId);
     }
 
+    function registerFI(bytes32 collector, uint64 epoch, bytes32 scheduleRoot, uint64 count,
+                        address submitter, bytes32 policyId) external {
+        if (msg.sender != owner) revert Unauthorized();
+        if (collector == 0 || scheduleRoot == 0 || count == 0 || count > 10000 ||
+            submitter == address(0) || policyId == 0 || epoch == 0 || epochs[collector][epoch].exists) revert InvalidEpoch();
+        if (epoch > 1 && (!epochs[collector][epoch-1].exists || epochs[collector][epoch-1].revokedBlock == 0)) revert InvalidEpoch();
+        epochs[collector][epoch] = Epoch(scheduleRoot, submitter, 0, true, bytes32(0), policyId);
+        fiSchedules[collector][epoch].push(FISchedule(scheduleRoot, 1, count));
+        emit Registered(collector, epoch, scheduleRoot, bytes32(0), policyId);
+        emit FIScheduleRegistered(collector, epoch, scheduleRoot, 1, count);
+    }
+
+    function renewFI(bytes32 collector, uint64 epoch, bytes32 scheduleRoot, uint64 count) external {
+        if (msg.sender != owner) revert Unauthorized();
+        Epoch storage identity = epochs[collector][epoch];
+        if (!identity.exists || identity.revokedBlock != 0 ||
+            fiSchedules[collector][epoch].length == 0 || scheduleRoot == 0 || count == 0 || count > 10000) revert InvalidEpoch();
+        uint64 next = latestPeriod[collector][epoch] + 1;
+        fiSchedules[collector][epoch].push(FISchedule(scheduleRoot, next, count));
+        emit FIScheduleRegistered(collector, epoch, scheduleRoot, next, count);
+    }
+
+    function getFISchedule(bytes32 collector, uint64 epoch, uint64 period)
+        external view returns (bytes32, uint64, uint64) {
+        FISchedule[] storage schedules = fiSchedules[collector][epoch];
+        // Newest schedule has precedence when an old schedule was renewed early.
+        for (uint256 i = schedules.length; i > 0; --i) {
+            FISchedule storage schedule = schedules[i-1];
+            if (period >= schedule.start && period < schedule.start + schedule.count)
+                return (schedule.root, schedule.start, schedule.count);
+        }
+        return (bytes32(0),0,0);
+    }
+
+    function getFIAnchor(bytes32 collector, uint64 epoch, uint64 batchNumber)
+        external view returns (uint64, bytes32) {
+        FIAnchor memory anchorRecord = fiAnchors[collector][epoch][batchNumber];
+        return (anchorRecord.period, anchorRecord.scheduleRoot);
+    }
+
     function revoke(bytes32 collector, uint64 epoch) external {
         if (msg.sender != owner) revert Unauthorized();
         Epoch storage entry = epochs[collector][epoch];
@@ -67,6 +115,15 @@ contract CollectorAnchorRegistry {
         bytes32 merkleRoot, bytes32 lastChain, uint64 firstSequence,
         uint64 lastSequence, bytes32 previousManifestHash
     ) external {
+        if (fiSchedules[collector][epoch].length != 0) revert InvalidAnchor();
+        _anchor(collector,epoch,batchNumber,manifestHash,merkleRoot,lastChain,firstSequence,lastSequence,previousManifestHash);
+    }
+
+    function _anchor(
+        bytes32 collector, uint64 epoch, uint64 batchNumber, bytes32 manifestHash,
+        bytes32 merkleRoot, bytes32 lastChain, uint64 firstSequence,
+        uint64 lastSequence, bytes32 previousManifestHash
+    ) internal {
         Epoch storage entry = epochs[collector][epoch];
         if (!entry.exists || msg.sender != entry.submitter || entry.revokedBlock != 0) revert Unauthorized();
         if (manifestHash == 0 || merkleRoot == 0 || batchNumber == 0 || lastSequence < firstSequence) revert InvalidAnchor();
@@ -82,7 +139,8 @@ contract CollectorAnchorRegistry {
                 previousManifestHash != anchors[collector][epoch][batchNumber-1].manifestHash) revert InvalidAnchor();
             // These values are the pinned digest("PABLA-POLICY-v1", name) test vectors.
             if (entry.policyId == POLICY_P1 || entry.policyId == POLICY_A1 ||
-                entry.policyId == POLICY_A4 || entry.policyId == POLICY_A5) {
+                entry.policyId == POLICY_A4 || entry.policyId == POLICY_A5 ||
+                fiSchedules[collector][epoch].length != 0) {
                 if (previousManifestHash != anchors[collector][epoch][batchNumber-1].manifestHash) revert InvalidAnchor();
             }
         }
@@ -90,6 +148,30 @@ contract CollectorAnchorRegistry {
         latestBatch[collector][epoch] = batchNumber;
         latestSequence[collector][epoch] = lastSequence;
         emit Anchored(collector, epoch, batchNumber, manifestHash, merkleRoot);
+    }
+
+    function anchorFI(
+        bytes32 collector, uint64 epoch, uint64 batchNumber, bytes32 manifestHash,
+        bytes32 merkleRoot, bytes32 lastChain, uint64 firstSequence,
+        uint64 lastSequence, bytes32 previousManifestHash, uint64 period, bytes32 scheduleRoot
+    ) external {
+        if (fiSchedules[collector][epoch].length == 0 || period != batchNumber ||
+            period != latestPeriod[collector][epoch] + 1) revert InvalidAnchor();
+        FISchedule[] storage schedules = fiSchedules[collector][epoch];
+        bool matching = false;
+        for (uint256 i = schedules.length; i > 0; --i) {
+            FISchedule storage periodSchedule = schedules[i-1];
+            if (period >= periodSchedule.start && period < periodSchedule.start+periodSchedule.count) {
+                matching = scheduleRoot == periodSchedule.root;
+                break;
+            }
+        }
+        if (!matching) revert InvalidAnchor();
+        // Delegate immutable anchoring invariants to the shared internal routine.
+        _anchor(collector,epoch,batchNumber,manifestHash,merkleRoot,lastChain,
+                firstSequence,lastSequence,previousManifestHash);
+        fiAnchors[collector][epoch][batchNumber] = FIAnchor(period,scheduleRoot);
+        latestPeriod[collector][epoch] = period;
     }
 
     function getEpoch(bytes32 collector, uint64 epoch) external view returns (bytes32, address, uint64, bool, bytes32, bytes32) {
