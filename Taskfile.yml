@@ -1,0 +1,12 @@
+version: '3'
+tasks:
+  test:
+    cmds: ['uv run --extra test pytest -q']
+  contracts:
+    cmds: ['cd contracts && forge test -vv']
+  demo:
+    cmds: ['uv run python Main.py']
+  full:
+    cmds: ['uv run python Main.py --profile full --trials 30 --events 10000']
+  deploy:
+    cmds: ['cd contracts && forge build', 'uv run --extra chain python scripts/deploy_contract.py']

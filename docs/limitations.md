@@ -1,0 +1,7 @@
+# Known limitations and deployment gate
+
+This codebase is an independently testable research implementation with a genuine EVM client path, but it is not audited production security infrastructure. Core cryptography is computed using SHA-256 and the `cryptography` Ed25519 implementation; the protocol construction has not received formal proof or cryptanalysis. Its in-memory backend is a deterministic test double, not Ethereum.
+
+Known issues before journal-grade use: durable crash recovery for a live collector has not been established; startup creates a new key each trial rather than a persistent protected KMS-managed key; cross-language RFC 8785 interoperability is not guaranteed; E4 pilot uses physically paced short traces while full-rate 10,000-event conditions require long-duration experiments; EVM toolchain is untested in this runtime; on-chain metadata leaks timings and batch rates; benchmark methods have differing security properties; no commercial-grade SIEM connector or high-availability archive. Local-chain and synthetic-data performance should not be generalized to public-chain costs, consensus security or real-world security incident rates.
+
+Future security engineering should introduce a transactional write-ahead outbox, secure key custody and hardware attestation where justified, Byzantine/finality threat analysis, redundant archives, multi-source external witnesses and protocol-specific formal security proofs.

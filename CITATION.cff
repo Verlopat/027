@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use this software, cite this repository and its exact commit."
+title: "PABLA: provenance-aware batched log anchoring research software"
+type: software
+version: 0.1.0
+repository-code: "https://github.com/Verlopat/027"
+license: MIT

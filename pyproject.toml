@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pabla-research"
+version = "0.1.0"
+description = "Verifiable provenance and continuity for batched security telemetry"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "cryptography>=45,<47", "scipy>=1.14,<2", "matplotlib>=3.9,<4", "pandas>=2.2,<3"
+]
+
+[project.optional-dependencies]
+chain = ["web3>=7.9,<8"]
+parquet = ["pyarrow>=18,<24"]
+test = ["pytest>=8,<10"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pabla"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
