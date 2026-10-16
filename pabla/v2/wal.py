@@ -8,6 +8,7 @@ Production forward secrecy needs a separately validated hardened key store.
 from __future__ import annotations
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from .checkpoint import Checkpoint,Sealed
 
@@ -26,12 +27,29 @@ class PersistentLog:
             self.db.execute('INSERT INTO state VALUES(1,?,?,?,?)',(public_root,initial_seed,1,b'\x00'*32))
         state=self.state()
         if state[0]!=public_root:raise ValueError('unexpected schedule root')
+    @contextmanager
+    def _txn(self):
+        """Explicit SQLite write transaction (isolation_level=None is autocommit)."""
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            yield
+            self.db.execute('COMMIT')
+        except BaseException:
+            if self.db.in_transaction:
+                try:self.db.execute('ROLLBACK')
+                except BaseException:pass
+            raise
+
+    def set_fault_injector(self,injector):
+        """Test hook: intercept SQL and transaction durability boundaries."""
+        from .faults import FaultyConnection
+        self.db=FaultyConnection(self.db,injector)
     def close(self)->None:self.db.close()
     def state(self):return self.db.execute('SELECT root,seed,period,prev FROM state WHERE id=1').fetchone()
     def events(self)->list[bytes]:return [v[0] for v in self.db.execute('SELECT event FROM events ORDER BY idx')]
     def append(self,event:bytes)->int:
         if self.db.execute('SELECT 1 FROM intent LIMIT 1').fetchone():raise ValueError('unresolved seal intent')
-        with self.db:
+        with self._txn():
             index=self.db.execute('SELECT COUNT(*) FROM events').fetchone()[0]
             self.db.execute('INSERT INTO events(idx,event) VALUES(?,?)',(index,event))
         return index
@@ -39,14 +57,14 @@ class PersistentLog:
         row=self.db.execute('SELECT period,payload FROM intent ORDER BY period LIMIT 1').fetchone()
         return (row[0],Checkpoint.from_dict(json.loads(row[1]))) if row else None
     def begin_seal(self,cp:Checkpoint)->None:
-        with self.db:
+        with self._txn():
             state=self.state()
             if cp.period!=state[2]:raise ValueError('stale seal period')
             self.db.execute('INSERT INTO intent(period,payload) VALUES(?,?)',
                             (cp.period,json.dumps(cp.to_dict(),sort_keys=True)))
     def complete_seal(self,sealed:Sealed,next_seed:bytes)->None:
         cp=sealed.checkpoint
-        with self.db:
+        with self._txn():
             state=self.state(); intent=self.pending_intent()
             if not intent or intent[0]!=cp.period or intent[1]!=cp or state[2]!=cp.period:
                 raise ValueError('intent does not match persisted state')

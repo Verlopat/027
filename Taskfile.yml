@@ -10,3 +10,11 @@ tasks:
     cmds: ['uv run python Main.py --profile full --trials 30 --events 10000']
   deploy:
     cmds: ['cd contracts && forge build', 'uv run --extra chain python scripts/deploy_contract.py']
+  test:property:nightly:
+    cmds: ['HYPOTHESIS_PROFILE=nightly uv run --extra test pytest -q tests/v2/property']
+  coverage:
+    cmds: ['uv run --extra test pytest tests/v2 --cov=pabla.v2 --cov-branch --cov-report=term-missing --cov-fail-under=90']
+  mutation:
+    cmds: ['uv run --extra test mutmut run']
+  repro:quick:
+    cmds: ['uv run --extra test pytest -q', 'uv run python Main.py --v2 --events 16']

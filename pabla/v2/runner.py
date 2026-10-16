@@ -132,8 +132,8 @@ def execute(run:Path,*,seed:int,events:int,gas_csv:str='')->dict:
         'not_run':['live_evm_gas','external_journald_baseline','tessera_baseline',
                    'two_machine_replication','full_x01_x12_campaign','independent_formal_review']}
     atomic_json(run/'report.json',report)
-    atomic_json(run/'environment.json',{'python':sys.version,'machine':platform.machine(),
-         'system':platform.platform(),'seed':seed,'source':'local-reference-execution'})
+    from .envcapture import capture
+    atomic_json(run/'environment.json',dict(capture(),seed=seed,source='local-reference-execution'))
     witness.close();collector.close()
     return report
 

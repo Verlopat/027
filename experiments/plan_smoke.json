@@ -1,0 +1,15 @@
+{
+  "description": "REFERENCE SMOKE ONLY, not the X1-X12 scientific campaign",
+  "shuffle_seed": 123456,
+  "cells": [
+    {"id": "x01-regression", "runner": "python-tests", "timeout_s": 180},
+    {"id": "x03-reference-smoke", "runner": "v2-smoke", "events": 8, "timeout_s": 90},
+    {"id": "x04-witness-message-cost", "runner": "witness-messages", "timeout_s": 90},
+    {"id": "x05-crypto-reference", "runner": "crypto-microbenchmark", "runs": 5, "timeout_s": 90},
+    {"id": "x10-wal-faults", "runner": "wal-fault-tests", "timeout_s": 180},
+    {"id": "x06-evm-gas", "runner": "not_available", "reason": "requires Foundry/Anvil receipt collection"},
+    {"id": "x07-real-price-policy", "runner": "not_available", "reason": "requires verified public price data"},
+    {"id": "x11-public-log-replay", "runner": "not_available", "reason": "requires verified licensed input"},
+    {"id": "x12-cross-language-vectors", "runner": "not_available", "reason": "requires independent implementation"}
+  ]
+}

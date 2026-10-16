@@ -206,18 +206,43 @@ under an attacker who obtains disk images, page caches or process-memory copies.
 The pure-Python secp256k1 implementation is neither constant-time nor side-channel
 hardened. Do not deploy it for production key custody.
 
-### Signed v2 EVM integration (Foundry + Anvil)
 
-```bash
-cd contracts && forge test -vv && cd ..
-# In another terminal: anvil --chain-id 31337 --port 8545
-uv sync --extra chain --extra test
-uv run python scripts/v2_anvil_smoke.py
+## Additional v2 research infrastructure (local completion copy)
+
+The following modules extend the reference implementation and require
+independent review before use in security-sensitive production deployments.
+
+- `pabla/v2/envcapture.py`: provenance including source revision, dirty-tree
+  status, lockfile digest, CPU details and installed tool versions.
+- `pabla/v2/backends.py`: selectable reference/native signer API. The native
+  libsecp256k1 path is optional and was **not** tested when its dependencies
+  were unavailable. Python ECC is not constant time.
+- `pabla/v2/keystore.py`: SQLite and atomic file seed-store interfaces. These
+  do **not** guarantee secure erasure.
+- `pabla/v2/faults.py`: deterministic SQL durability-boundary injection. A
+  critical SQLite autocommit bug in `wal.py` was fixed by adding explicit
+  `BEGIN IMMEDIATE` / `COMMIT` / rollback transactions.
+- `pabla/v2/witness_set.py` and `reporting.py`: independent cosignature quorum,
+  gossip-in-process and trusted time-policy reporting. Byzantine quorum
+  intersection needs `2*quorum > witness_count + max_corrupt`.
+- `pabla/v2/streaming.py`: single-pass event verification with logarithmic
+  Merkle state, exercised with real timed synthetic million-event workloads.
+- `pabla/v2/adversary.py`: bounded verifier-oracle search over archive and
+  signed-pending attacks. It is **not** a general optimal-adversary proof.
+- `experiments/runners/campaign.py`: isolated subprocess smoke campaign,
+  complete logs and `not_run` statuses for unavailable experiments.
+
+Quick validation from an installed project environment:
+
+```sh
+uv run --extra test pytest -q
+uv run python Main.py --v2 --events 16
+uv run python -m experiments.runners.campaign --plan experiments/plan_smoke.json
+uv run python scripts/bench_stream.py --events 1000000
 ```
 
-This separate integration deploys `AnchorLogV2` to **Anvil**, anchors two
-secp256k1-signed checkpoints, submits a valid same-period equivocation proof,
-checks revocation, and records actual transaction gas from receipts under
-`output/v2-anvil-smoke.json`. It is distinct from the in-memory research smoke.
-The GitHub Foundry/Anvil CI job exercises it; public-network deployment and
-full cost/performance evaluation remain outside the smoke test.
+Full replication, Tamarin verification, external secure-logging baseline
+comparisons, dataset permissions, native crypto/erasure validation, formal
+proof checking, and a complete X1–X12 campaign remain external validation
+obligations. See `docs/reproducing.md`, `docs/crash-safety.md` and
+`docs/baselines.md` for precise assumptions and limitations.

@@ -8,3 +8,12 @@ contracts/out/
 contracts/cache/
 contract-deployment.json
 .DS_Store
+
+# Scientific experiment data and mutable outputs
+results/
+data/raw/
+.coverage
+coverage.xml
+.mutmut-cache/
+*.sqlite
+*.sqlite-journal

@@ -1,0 +1,40 @@
+name: Extended v2 security tests
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * 1'
+permissions:
+  contents: read
+jobs:
+  nightly-property:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Property tests (10,000 cases per property)
+        env:
+          HYPOTHESIS_PROFILE: nightly
+        run: uv run --extra test python -m pytest -q tests/v2/property --junitxml=property.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: property-tests
+          path: property.xml
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Mutation tests
+        run: |
+          uv run --extra test mutmut run 2>&1 | tee mutation.log
+          uv run --extra test mutmut results > mutation-results.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-output
+          path: |
+            mutation.log
+            mutation-results.txt
