@@ -4,7 +4,12 @@ from pabla.analysis import aggregate,mcnemar_p,exact_ci,holm,bootstrap_median_ci
 
 def test_experiments_local(tmp_path):
     o=Options(trials=1,event_count=12,batch_size=6)
-    suite=run_all(tmp_path,o) if False else None
+    (tmp_path / "results" / "raw").mkdir(parents=True)
+    (tmp_path / "results" / "derived").mkdir(parents=True)
+    suite=run_all(tmp_path,o)
+    derived=aggregate(suite,tmp_path)
+    assert len(suite)==7 and derived["detection"]
+    assert (tmp_path / "results" / "derived" / "summary.json").exists()
     assert integrity(o)
     assert continuity(o)
     assert overhead(o)

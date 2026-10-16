@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from .ledger import InMemoryLedger
-from .protocol import Collector, Policy, ProtocolError, Batch, keypair, manifest_hash, sign, utc_now, verify_batch, verify_history
+from .protocol import Collector, Policy, ProtocolError, Batch, keypair, manifest_hash, sign, utc_now, verify_batch, verify_history, verify_complete_history
 from .storage import RunIndex, archive_size, manifest_metadata, save_batch, write_json, write_jsonl
-from .workloads import attack_batch, generate_events
+from .workloads import attack_batch, adaptive_attack_batch, generate_events
 
 METHODS = ('P1','B1','B2','B3','B4','A1','A2','A3','A4','A5')
 ATTACKS = ('AT1','AT2','AT3','AT4','AT5','AT6','AT7','AT8','AT9','AT10')
@@ -62,26 +62,31 @@ def _make(options: Options, method: str, seed: int, count: int, batch_size: int,
         # The payload generator seed remains paired across comparison methods.
         collector_id = f'trial-{time.time_ns()}-{method}'
     sk, pk = keypair()
-    ledger.register(collector_id, epoch, pk)
+    ledger.register(collector_id, epoch, pk, policy_name=method)
     policy = Policy.for_name(method)
     collector = Collector(collector_id, epoch, sk, policy)
     if events is None:
         events = generate_events(count, seed, collector_id, epoch, timestamp=options.base_timestamp)
     batches: list[Batch] = []
     receipts = []
-    t0 = time.perf_counter_ns()
+    build_ns = 0
+    anchor_ns = 0
     batch_size = 1 if method == 'B1' else batch_size
     for offset in range(0, count, batch_size):
+        t0 = time.perf_counter_ns()
         batch = collector.collect(events[offset:offset+batch_size])
+        build_ns += time.perf_counter_ns() - t0
         batches.append(batch)
         if policy.anchor:
+            ta = time.perf_counter_ns()
             receipts.append(ledger.anchor(batch))
-    build_ns = time.perf_counter_ns() - t0
+            anchor_ns += time.perf_counter_ns() - ta
     tv = time.perf_counter_ns()
     verdicts = verify_history(batches, ledger, policy)
     verify_ns = time.perf_counter_ns() - tv
     if any(v.status != 'ACCEPT' for v in verdicts):
         raise AssertionError(f'{method} valid baseline failed: {[v.as_dict() for v in verdicts]}')
+    ledger.measurement_anchor_ns = anchor_ns
     return ledger, collector, batches, receipts, build_ns, verify_ns
 
 
@@ -105,15 +110,16 @@ def integrity(options: Options) -> list[dict]:
         for method in ('P1','B1','B2','B3','B4','A3','A4','A5'):
             for attack in ('AT1','AT6','AT8'):
                 l,c,bs,_,_,_ = _make(options,method,options.seed+trial,options.event_count,options.batch_size)
-                attacked = attack_batch(bs[0], attack)
-                t0 = time.perf_counter_ns()
-                v = verify_batch(attacked, l, policy=c.policy)
-                rows.append(_row('E1',method,trial,l,attack=attack,verdict=v.status,
-                                 anomalies=';'.join(v.anomalies), detected=int(_record_status(v)),
-                                 verify_ns=time.perf_counter_ns()-t0,valid_case=False))
+                for model in ('naive','adaptive'):
+                    attacked = attack_batch(bs[0], attack) if model=='naive' else adaptive_attack_batch(bs[0],attack,c.policy)
+                    t0 = time.perf_counter_ns()
+                    v = verify_batch(attacked, l, policy=c.policy)
+                    rows.append(_row('E1',method,trial,l,attack=attack,attacker_model=model,verdict=v.status,
+                                     anomalies=';'.join(v.anomalies), detected=int(_record_status(v)),
+                                     verify_ns=time.perf_counter_ns()-t0,valid_case=False))
                 good = verify_batch(bs[0], l, policy=c.policy)
                 rows.append(_row('E1',method,trial,l,attack='NONE',verdict=good.status,
-                                 anomalies='',detected=int(_record_status(good)),valid_case=True))
+                                 anomalies=';'.join(good.anomalies),attacker_model='none',detected=int(_record_status(good)),valid_case=True))
             # AT7 is a rejected submission, not retroactive rejection of a valid old anchor.
             l,c,bs,_,_,_ = _make(options,method,options.seed+trial,options.event_count,options.batch_size)
             l.revoke(c.collector_id,c.epoch)
@@ -130,7 +136,7 @@ def integrity(options: Options) -> list[dict]:
                     rejected = True
                     failure = type(exc).__name__
             rows.append(_row('E1',method,trial,l,attack='AT7',verdict='REJECT_SUBMISSION' if rejected else 'UNCONTROLLED_OFFCHAIN',
-                             anomalies=failure,detected=int(rejected),valid_case=False))
+                             anomalies=failure,attacker_model='revoked-submission',detected=int(rejected),valid_case=False))
     return rows
 
 
@@ -153,16 +159,27 @@ def continuity(options: Options) -> list[dict]:
                     else:
                         changed = attack_batch(bs[0],attack)
                         v = verify_batch(changed,l,policy=c.policy)
-                rows.append(_row('E2',method,trial,l,attack=attack,verdict=v.status,
+                rows.append(_row('E2',method,trial,l,attack=attack,attacker_model='naive',verdict=v.status,
                                  anomalies=';'.join(v.anomalies),detected=int(_record_status(v)),valid_case=False))
-            rows.append(_row('E2',method,trial,l,attack='NONE',verdict='ACCEPT',anomalies='',detected=0,valid_case=True))
+            honest = verify_history(bs,l,c.policy)
+            # Tail truncation must be assessed against the *trusted ledger tip*.
+            if method in ('P1','B1','B4','A1','A2') and len(bs)>1:
+                missing_tail = verify_complete_history(bs[:-1],l,policy=c.policy,collector_id=c.collector_id,epoch=c.epoch)
+                bad = missing_tail[-1]
+                rows.append(_row('E2',method,trial,l,attack='TAIL_TRUNCATION',attacker_model='archive-truncation',
+                                 verdict=bad.status,anomalies=';'.join(bad.anomalies),detected=int(_record_status(bad)),valid_case=False))
+            rows.append(_row('E2',method,trial,l,attack='NONE',attacker_model='none',verdict=honest[-1].status,
+                             anomalies=';'.join(honest[-1].anomalies),
+                             detected=int(any(_record_status(x) for x in honest)),valid_case=True))
     return rows
 
 
 def overhead(options: Options) -> list[dict]:
     rows = []
     for trial in range(options.trials):
-        for method in ('P1','B1','B2','B3','B4'):
+        methods=list(('P1','B1','B2','B3','B4'))
+        random.Random(options.seed+trial).shuffle(methods)
+        for method in methods:
             count = min(options.event_count, 250 if method == 'B1' and options.profile != 'full' else 10_000)
             l,c,bs,receipts,build_ns,verify_ns = _make(options,method,options.seed+trial,count,
                                                          min(options.batch_size,count))
@@ -172,9 +189,10 @@ def overhead(options: Options) -> list[dict]:
                 transactions=len(receipts),tx_per_event=len(receipts)/count,
                 evm_gas_used=sum(r.get('gas_used',0) for r in receipts) if evm else None,
                 evm_input_bytes=sum(r.get('transaction_input_bytes',0) for r in receipts) if evm else None,
-                build_ns_per_event=build_ns/count,verify_ns_per_event=verify_ns/count,
+                build_ns_per_event=build_ns/count,anchor_ns_per_event=l.measurement_anchor_ns/count,verify_ns_per_event=verify_ns/count,
                 encoded_artifact_bytes=sum(len(json.dumps(b.export())) for b in bs),
-                measurement_type='measured-anvil' if evm else 'measured-nonchain-test-double'))
+                method_order=methods.index(method), chain_reset_before_method=False,
+                measurement_type='measured-anvil-shared-state' if evm else 'measured-nonchain-test-double'))
     return rows
 
 
@@ -192,14 +210,16 @@ def tradeoff(options: Options) -> list[dict]:
             for rate in rates:
                 count = options.event_count if options.profile=='full' else min(options.event_count,24)
                 bs=min(requested_bs,count)
-                for method in ('P1','B4'):
+                methods = ['P1','B4']
+                random.Random(options.seed + trial + rate + bs).shuffle(methods)
+                for method in methods:
                     ledger=ledger_for(options)
                     identifier = f'e4-{time.time_ns()}-{method}' if options.backend=='anvil' else 'e4-collector'
                     sk,pk=keypair()
-                    ledger.register(identifier,1,pk)
+                    ledger.register(identifier,1,pk,policy_name=method)
                     collector=Collector(identifier,1,sk,Policy.for_name(method))
                     events=generate_events(count,options.seed+trial,identifier,1,timestamp=options.base_timestamp or utc_now())
-                    pending=[];arrivals=[];delays=[];build_ns=0;verify_ns=0;receipts=[]
+                    pending=[];arrivals=[];delays=[];build_ns=0;verify_ns=0;anchor_ns=0;receipts=[]
                     start=time.perf_counter()
                     for i,event in enumerate(events):
                         target=start+i/rate
@@ -213,11 +233,13 @@ def tradeoff(options: Options) -> list[dict]:
                             batch=collector.collect(pending)
                             build_ns+=time.perf_counter_ns()-bstart
                             if collector.policy.anchor:
+                                ta=time.perf_counter_ns()
                                 receipts.append(ledger.anchor(batch))
+                                anchor_ns += time.perf_counter_ns()-ta
                             confirmed=time.perf_counter_ns()
                             delays.extend((confirmed-at)/1e6 for at in arrivals)
                             tverify=time.perf_counter_ns()
-                            verdict=verify_batch(batch,ledger,previous=None if batch.manifest['batch_number']==1 else prev_manifest)
+                            verdict=verify_batch(batch,ledger,policy=collector.policy,previous=None if batch.manifest['batch_number']==1 else prev_manifest)
                             verify_ns+=time.perf_counter_ns()-tverify
                             if verdict.status!='ACCEPT':
                                 raise AssertionError(f'E4 honest stream rejected: {verdict}')
@@ -226,10 +248,11 @@ def tradeoff(options: Options) -> list[dict]:
                     delays.sort()
                     rows.append(_row('E4',method,trial,ledger,batch_size=requested_bs,effective_batch_size=bs,
                         event_rate=rate,events=count,build_ns_per_event=build_ns/count,
-                        verify_ns_per_event=verify_ns/count,
+                        verify_ns_per_event=verify_ns/count,anchor_ns_per_event=anchor_ns/count,
                         measured_e2e_anchor_delay_median_ms=statistics.median(delays),
                         measured_e2e_anchor_delay_p95_ms=delays[min(count-1,int(.95*(count-1)))],
-                        transactions=len(receipts),physical_pacing=True))
+                        transactions=len(receipts),physical_pacing=True,chain_latency_measured=ledger.backend=='anvil-evm',
+                        chain_reset_before_method=False,method_order=methods.index(method)))
     return rows
 
 
@@ -239,7 +262,7 @@ def recovery(options: Options) -> list[dict]:
         l,c,batches,_,_,_ = _make(options,'P1',options.seed+trial,options.event_count,options.batch_size)
         last_digest = batches[-1].manifest_digest
         old_public = l.identity(c.collector_id,1)['public_key']
-        before = verify_batch(batches[-1],l,previous=batches[-2].manifest if len(batches)>1 else None)
+        before = verify_batch(batches[-1],l,policy=c.policy,previous=batches[-2].manifest if len(batches)>1 else None)
         t0 = time.perf_counter_ns()
         rev_receipt = l.revoke(c.collector_id,1)
         fresh = generate_events(options.batch_size,options.seed+trial+1,c.collector_id,1)
@@ -252,13 +275,13 @@ def recovery(options: Options) -> list[dict]:
         except (ProtocolError,ValueError):
             blocked = True
         sk2,pk2 = keypair()
-        l.register(c.collector_id,2,pk2,recovery=last_digest)
+        l.register(c.collector_id,2,pk2,recovery=last_digest,policy_name="P1")
         c2 = Collector(c.collector_id,2,sk2)
         ev2 = generate_events(min(options.batch_size,options.event_count),options.seed+trial+2,c.collector_id,2)
         new_batch = c2.collect(ev2)
         l.anchor(new_batch)
-        new_verdict = verify_batch(new_batch,l)
-        old_after = verify_batch(batches[-1],l,previous=batches[-2].manifest if len(batches)>1 else None)
+        new_verdict = verify_batch(new_batch,l,policy=c2.policy)
+        old_after = verify_batch(batches[-1],l,policy=c.policy,previous=batches[-2].manifest if len(batches)>1 else None)
         rows.append(_row('E5','P1',trial,l,revocation_block=rev_receipt['block_number'],
             old_key=old_public,late_submission_rejected=int(blocked),
             new_epoch_accepted=int(new_verdict.status=='ACCEPT'),
@@ -277,7 +300,7 @@ def residual(options: Options) -> list[dict]:
             ev['payload']['process'] = '/usr/bin/fabricated-event'
         forged = c.collect(fake)
         l.anchor(forged)
-        verdict = verify_batch(forged,l,previous=bs[-1].manifest)
+        verdict = verify_batch(forged,l,policy=c.policy,previous=bs[-1].manifest)
         rows.append(_row('E6','P1',trial,l,attack='AT9',scenario='active-key-fabricated-log',
                          verdict=verdict.status,cryptographic_accept=int(verdict.status=='ACCEPT'),
                          ground_truth='synthetically fabricated by adversary holding legitimate key'))
@@ -288,7 +311,7 @@ def residual(options: Options) -> list[dict]:
             ev['collector_monotonic_ns'] = options.batch_size+i+1
         candidate = c2.collect(shifted, wall_time='2001-01-01T00:00:00.000Z')
         l2.anchor(candidate)
-        skew_verdict=verify_batch(candidate,l2,previous=old[-1].manifest)
+        skew_verdict=verify_batch(candidate,l2,policy=c2.policy,previous=old[-1].manifest)
         rows.append(_row('E6','P1',trial,l2,attack='AT5',scenario='valid-signature-implausible-clock',
                          verdict=skew_verdict.status,cryptographic_accept=int(skew_verdict.status=='ACCEPT'),
                          ground_truth='signed wall-clock skew'))
@@ -296,18 +319,23 @@ def residual(options: Options) -> list[dict]:
 
 
 def stability(options: Options) -> list[dict]:
+    """Every memory/CPU trial runs in a fresh process; RSS is not cumulative."""
+    import subprocess
+    import sys
     rows=[]
     for trial in range(max(options.trials,3)):
         for method in ('P1','B1'):
-            begin = resource.getrusage(resource.RUSAGE_SELF)
-            t0=time.perf_counter_ns()
-            l,c,batches,receipt,build,verify=_make(options,method,options.seed+trial,min(options.event_count,250),options.batch_size)
-            elapsed=time.perf_counter_ns()-t0
-            end=resource.getrusage(resource.RUSAGE_SELF)
-            rows.append(_row('E7',method,trial,l,elapsed_ns=elapsed,build_ns=build,verify_ns=verify,
-                             user_cpu_s=end.ru_utime-begin.ru_utime,
-                             system_cpu_s=end.ru_stime-begin.ru_stime,
-                             max_rss_kb=end.ru_maxrss,measurement_type='local-process'))
+            params = {'method': method, 'trial': trial, 'count': min(options.event_count,250),
+                      'batch_size': options.batch_size, 'seed': options.seed+trial,
+                      'base_timestamp': options.base_timestamp or utc_now(), 'backend': options.backend,
+                      'rpc': options.rpc, 'contract_address': options.contract_address, 'abi_path': options.abi_path}
+            cmd=[sys.executable,'-m','pabla.stability_worker',json.dumps(params)]
+            proc=subprocess.run(cmd,capture_output=True,text=True,timeout=300,check=False)
+            if proc.returncode:
+                raise RuntimeError(f'E7 child process failed: {proc.stderr[-1000:]}')
+            measurements=json.loads(proc.stdout)
+            rows.append(_row('E7',method,trial,type('Backend',(),{'backend': 'anvil-evm' if options.backend=='anvil' else 'in-memory-test-only'})(),
+                             **measurements,measurement_type='isolated-process'))
     return rows
 
 

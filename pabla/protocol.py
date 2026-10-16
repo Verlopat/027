@@ -333,8 +333,10 @@ class Verdict:
         return {"status": self.status, "anomalies": self.anomalies, "manifest_digest": self.manifest_digest}
 
 
-def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: Policy | None = None,
+def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: Policy,
                  previous: dict[str, Any] | None = None, max_skew_seconds: float = 300.0) -> Verdict:
+    if not isinstance(policy, Policy):
+        raise ProtocolError("trusted verification policy is required")
     if batch is None:
         return Verdict("UNDETERMINED_ARCHIVE_MISSING", ["ARCHIVE_MISSING"])
     try:
@@ -343,7 +345,9 @@ def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: P
         m = batch.manifest
         if not isinstance(m, dict) or m.get("protocol_version") != PROTOCOL:
             raise ProtocolError("wrong manifest version")
-        method = policy or Policy.for_name(m.get("method"))
+        method = policy
+        if m.get("method") != method.name:
+            return Verdict("REJECT_AUTHORIZATION", ["POLICY_DOWNGRADE"])
         collector, epoch = m["collector_id"], m["epoch"]
         bn, first, last, count = (m[k] for k in ("batch_number", "first_sequence", "last_sequence", "event_count"))
         if any(type(x) is not int or x < 1 for x in (epoch, bn, first, last, count)) or count != last - first + 1 or count > MAX_BATCH:
@@ -356,11 +360,14 @@ def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: P
         if recorded_digest != batch.manifest_digest:
             return Verdict("REJECT_CONTENT_INTEGRITY", ["MANIFEST_DIGEST_MISMATCH"])
         identity = ledger.identity(collector, epoch)
+        if identity and identity.get("policy") != method.name:
+            return Verdict("REJECT_AUTHORIZATION", ["REGISTRY_POLICY_MISMATCH"])
         if method.sign_batches:
             if not identity:
                 return Verdict("REJECT_AUTHORIZATION", ["UNREGISTERED_COLLECTOR"])
             if not valid_signature(identity["public_key"], recorded_digest, batch.signature):
                 return Verdict("REJECT_AUTHORIZATION", ["INVALID_SIGNATURE"])
+        warnings: list[str] = []
         if previous is None:
             if bn != 1 or first != 1:
                 return Verdict("REJECT_CONTINUITY", ["MISSING_PREDECESSOR"])
@@ -374,7 +381,7 @@ def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: P
             if method.link_manifests and m["previous_manifest_hash"] != manifest_hash(previous):
                 return Verdict("REJECT_CONTINUITY", ["PREVIOUS_MANIFEST_MISMATCH"])
             if method.timestamps and m["monotonic_ns"] < previous["monotonic_ns"]:
-                return Verdict("ACCEPT_WITH_WARNING", ["MONOTONIC_REGRESSION"], recorded_digest)
+                warnings.append("MONOTONIC_REGRESSION")
         if method.chain and m["first_previous_chain"] != chain_prev:
             return Verdict("REJECT_CONTINUITY", ["CHAIN_LINK_MISMATCH"])
         curr_chain = chain_prev
@@ -408,15 +415,15 @@ def verify_batch(batch: Batch | dict[str, Any] | None, ledger: Any, *, policy: P
         if method.timestamps:
             timestamp = unix_seconds(m["wall_time"])
             if anchor and abs(timestamp - anchor["block_timestamp"]) > max_skew_seconds:
-                return Verdict("ACCEPT_WITH_WARNING", ["CLOCK_SKEW"], recorded_digest)
+                warnings.append("CLOCK_SKEW")
             if any(abs(unix_seconds(ev["event_time_utc"]) - timestamp) > max_skew_seconds for ev in batch.events):
-                return Verdict("ACCEPT_WITH_WARNING", ["EVENT_CLOCK_SKEW"], recorded_digest)
-        return Verdict("ACCEPT", [], recorded_digest)
+                warnings.append("EVENT_CLOCK_SKEW")
+        return Verdict("ACCEPT_WITH_WARNING" if warnings else "ACCEPT", warnings, recorded_digest)
     except (ProtocolError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
         return Verdict("REJECT_CONTENT_INTEGRITY", ["MALFORMED_ARTIFACT", type(exc).__name__])
 
 
-def verify_history(batches: list[Batch | dict[str, Any] | None], ledger: Any, policy: Policy | None = None) -> list[Verdict]:
+def verify_history(batches: list[Batch | dict[str, Any] | None], ledger: Any, policy: Policy) -> list[Verdict]:
     previous = None
     out = []
     for batch in batches:
@@ -425,3 +432,25 @@ def verify_history(batches: list[Batch | dict[str, Any] | None], ledger: Any, po
         if result.status in ("ACCEPT", "ACCEPT_WITH_WARNING") and batch is not None:
             previous = batch.manifest if isinstance(batch, Batch) else batch["manifest"]
     return out
+
+
+def verify_complete_history(batches: list[Batch | dict[str, Any] | None], ledger: Any, *,
+                            policy: Policy, collector_id: str, epoch: int) -> list[Verdict]:
+    """Validate a complete archive against an independently queried on-chain tip.
+
+    A missing archive cannot pass as complete merely because its prefix is valid.
+    The trusted collector/epoch selector must not be sourced from the archive.
+    """
+    tip_batch, tip_sequence = ledger.latest(collector_id, epoch)
+    verdicts = verify_history(batches, ledger, policy)
+    if not batches:
+        return [Verdict("REJECT_CONTINUITY", ["TRUNCATION"]) ] if tip_batch else []
+    last = batches[-1]
+    if last is None:
+        return verdicts + [Verdict("UNDETERMINED_ARCHIVE_MISSING", ["ARCHIVE_MISSING"])]
+    m = last.manifest if isinstance(last, Batch) else last.get("manifest", {})
+    if not isinstance(m, dict) or m.get("collector_id") != collector_id or m.get("epoch") != epoch:
+        return verdicts + [Verdict("REJECT_CONTINUITY", ["HISTORY_SCOPE_MISMATCH"])]
+    if policy.anchor and (m.get("batch_number") != tip_batch or m.get("last_sequence") != tip_sequence):
+        verdicts.append(Verdict("REJECT_CONTINUITY", ["TRUNCATION"]))
+    return verdicts

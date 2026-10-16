@@ -49,13 +49,13 @@ def aggregate(suite: dict[str,list[dict]], run: Path) -> dict:
     groups=defaultdict(list)
     for exp in ('e1_integrity','e2_continuity'):
         for row in suite.get(exp,[]):
-            groups[(exp,row['method'],row['attack'])].append(row)
+            groups[(exp,row['method'],row['attack'],row.get('attacker_model','unspecified'))].append(row)
     detection=[]
-    for (experiment,method,attack), rows in sorted(groups.items()):
+    for (experiment,method,attack,model), rows in sorted(groups.items()):
         k=sum(int(row['detected']) for row in rows)
-        low,high=exact_ci(k,len(rows))
-        detection.append({'experiment':experiment,'method':method,'attack':attack,'n':len(rows),
-                          'detected':k,'coverage':k/len(rows),'ci95_low':low,'ci95_high':high,
+        detection.append({'experiment':experiment,'method':method,'attack':attack,'attacker_model':model,
+                          'cases':len(rows),'detected':k,'coverage':k/len(rows),
+                          'inference':'deterministic observed test cases, no binomial CI or p-value',
                           'is_valid_case':attack=='NONE'})
     summary={'detection':detection,'timings':{},'paired_tests':[]}
     for exp in ('e3_overhead','e4_tradeoff','e7_stability'):
@@ -70,23 +70,13 @@ def aggregate(suite: dict[str,list[dict]], run: Path) -> dict:
                 'median':statistics.median(sample), 'mean':statistics.mean(sample),
                 'std':statistics.stdev(sample) if len(sample)>1 else None,'ci95_median':[lo,hi],
                 'cv':statistics.stdev(sample)/statistics.mean(sample) if len(sample)>1 and statistics.mean(sample)!=0 else None}
-    for exp in ('e1_integrity','e2_continuity'):
-        exp_rows=suite.get(exp,[])
-        attacks=sorted({r['attack'] for r in exp_rows if r['attack']!='NONE'})
-        for attack in attacks:
-            p1={r['trial']:r['detected'] for r in exp_rows if r['method']=='P1' and r['attack']==attack}
-            for baseline in ('B1','B2','B3','B4'):
-                b={r['trial']:r['detected'] for r in exp_rows if r['method']==baseline and r['attack']==attack}
-                common=sorted(set(p1)&set(b))
-                if common:
-                    summary['paired_tests'].append({'experiment':exp,'attack':attack,'method':'P1','baseline':baseline,
-                        'n_pairs':len(common),'p':mcnemar_p([p1[i] for i in common],[b[i] for i in common])})
-    adjusted=holm([r['p'] for r in summary['paired_tests']])
-    for row,p in zip(summary['paired_tests'],adjusted):
-        row['holm_p']=p
+    # Security outcomes are deterministic conditional on an input; treating random
+    # payload seeds as independent Bernoulli experiments is pseudoreplication.
+    # Do not publish McNemar p-values/Clopper-Pearson intervals on those rows.
+    summary['paired_tests'] = []
     write_json(run/'results'/'derived'/'summary.json',summary)
     _write_table(run/'results'/'derived'/'detection.csv',detection)
-    _write_table(run/'results'/'derived'/'paired_comparisons.csv',summary['paired_tests'])
+    # No significance test for deterministic attack classifications.
     return summary
 
 
@@ -105,7 +95,7 @@ def figures(run: Path, summary: dict) -> list[str]:
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     outputs=[]
-    rows=[r for r in summary['detection'] if r['method'] in ('P1','B1','B2','B3','B4') and r['attack']!='NONE']
+    rows=[r for r in summary['detection'] if r['method'] in ('P1','B1','B2','B3','B4') and r['attack']!='NONE' and r['attacker_model']=='adaptive']
     if rows:
         fig,ax=plt.subplots(figsize=(12,5))
         attack_labels=sorted({r['attack'] for r in rows})

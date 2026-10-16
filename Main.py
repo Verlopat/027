@@ -67,7 +67,7 @@ def main() -> int:
         n=min(count,args.batch_size)
         batch=collector.collect(generate_events(n,args.seed,collector.collector_id))
         receipt=check.anchor(batch)
-        verdict=verify_batch(batch,check)
+        verdict=verify_batch(batch,check,policy=collector.policy)
         if verdict.status!='ACCEPT':
             raise AssertionError(f'valid example rejected: {verdict}')
         path=save_batch(run,batch,receipt)

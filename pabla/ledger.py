@@ -27,7 +27,9 @@ class InMemoryLedger:
         self.block = 1
         self.clock = clock if clock is not None else time.time()
         self.calls = 0
-    def register(self, collector: str, epoch: int, public_key: str, *, recovery: str = "00" * 32) -> dict:
+    def register(self, collector: str, epoch: int, public_key: str, *, recovery: str = "00" * 32, policy_name: str = "P1") -> dict:
+        from .protocol import Policy
+        Policy.for_name(policy_name)
         if not is_hex32(public_key) or not is_hex32(recovery) or epoch < 1:
             raise ProtocolError("invalid key, recovery, or epoch")
         if (collector, epoch) in self._identities:
@@ -38,7 +40,7 @@ class InMemoryLedger:
                 raise ProtocolError("previous epoch must be revoked")
         self.block += 1
         self.calls += 1
-        self._identities[collector, epoch] = {"public_key": public_key, "revoked_block": 0, "recovery": recovery}
+        self._identities[collector, epoch] = {"public_key": public_key, "revoked_block": 0, "recovery": recovery, "policy": policy_name}
         return {"block_number": self.block, "block_timestamp": self.clock}
     def revoke(self, collector: str, epoch: int) -> dict:
         rec = self.identity(collector, epoch)
@@ -56,6 +58,8 @@ class InMemoryLedger:
         identity = self.identity(*k[:2])
         if not identity or identity["revoked_block"]:
             raise ProtocolError("unauthorized/revoked epoch")
+        if m.get("method") != identity["policy"]:
+            raise ProtocolError("registered policy mismatch")
         if k in self._anchors:
             raise ProtocolError("duplicate anchor")
         prev_key = (k[0], k[1], k[2] - 1)
@@ -66,6 +70,8 @@ class InMemoryLedger:
             prev = self._anchors.get(prev_key)
             if not prev or prev["last_sequence"] + 1 != m["first_sequence"]:
                 raise ProtocolError("nonconsecutive chain anchor")
+            if identity["policy"] in ("P1", "A1", "A4", "A5") and m["previous_manifest_hash"] != prev["manifest_hash"]:
+                raise ProtocolError("previous manifest commitment mismatch")
         self.block += 1
         self.calls += 1
         self.clock = max(self.clock, time.time())
@@ -78,6 +84,9 @@ class InMemoryLedger:
         return rec
     def anchor_record(self, collector: str, epoch: int, batch_number: int) -> dict | None:
         return self._anchors.get((collector, epoch, batch_number))
+    def latest(self, collector: str, epoch: int) -> tuple[int, int]:
+        records = [b for (c,e,_),b in self._anchors.items() if c == collector and e == epoch]
+        return (len(records), records[-1]["last_sequence"]) if records else (0, 0)
 
 
 class AnvilLedger:
@@ -113,8 +122,14 @@ class AnvilLedger:
             raise ProtocolError("contract bytes32 must be lowercase SHA256 hex")
         return bytes.fromhex(value)
     def _send(self, fn: Any) -> dict:
-        txid = fn.transact({"from": self.sender})
-        receipt = self.web3.eth.wait_for_transaction_receipt(txid, timeout=self.timeout_seconds)
+        try:
+            from web3.exceptions import ContractCustomError, ContractLogicError, TimeExhausted
+            txid = fn.transact({"from": self.sender})
+            receipt = self.web3.eth.wait_for_transaction_receipt(txid, timeout=self.timeout_seconds)
+        except (ContractCustomError, ContractLogicError, TimeExhausted, ValueError) as exc:
+            # Preserve revert selector/data for reproducible failure classification.
+            payload = getattr(exc, "data", None)
+            raise ProtocolError(f"EVM transaction rejected: {type(exc).__name__}: {payload or str(exc)}") from exc
         if receipt["status"] != 1:
             raise ProtocolError("reverted anchor/registry transaction")
         self.calls += 1
@@ -124,16 +139,19 @@ class AnvilLedger:
         return {"block_number": int(receipt["blockNumber"]), "block_timestamp": float(b["timestamp"]),
                 "tx_hash": txid.hex(), "gas_used": int(receipt["gasUsed"]),
                 "transaction_input_bytes": payload_size}
-    def register(self, collector: str, epoch: int, public_key: str, *, recovery: str = "00" * 32) -> dict:
+    def register(self, collector: str, epoch: int, public_key: str, *, recovery: str = "00" * 32, policy_name: str = "P1") -> dict:
         return self._send(self.contract.functions.register(self.b32(collector_key(collector)), epoch,
-                                                      self.b32(public_key), self.sender, self.b32(recovery)))
+                                                      self.b32(public_key), self.sender, self.b32(recovery), self.b32(digest("PABLA-POLICY-v1", policy_name))))
     def revoke(self, collector: str, epoch: int) -> dict:
         return self._send(self.contract.functions.revoke(self.b32(collector_key(collector)), epoch))
     def identity(self, collector: str, epoch: int) -> dict | None:
-        key, sender, block, exists, recovery = self.contract.functions.getEpoch(self.b32(collector_key(collector)), epoch).call()
+        key, sender, block, exists, recovery, policy_id = self.contract.functions.getEpoch(self.b32(collector_key(collector)), epoch).call()
         if not exists:
             return None
-        return {"public_key": bytes(key).hex(), "revoked_block": int(block), "recovery": bytes(recovery).hex()}
+        from .protocol import Policy
+        policy = next((name for name in ("P1", "B1", "B2", "B3", "B4", "A1", "A2", "A3", "A4", "A5")
+                       if self.b32(digest("PABLA-POLICY-v1", name)) == bytes(policy_id)), None)
+        return {"public_key": bytes(key).hex(), "revoked_block": int(block), "recovery": bytes(recovery).hex(), "policy": policy}
     def anchor(self, batch: Batch) -> dict:
         m = batch.manifest
         return self._send(self.contract.functions.anchor(
@@ -148,3 +166,8 @@ class AnvilLedger:
         return {"manifest_hash": bytes(mh).hex(), "merkle_root": bytes(root).hex(),
                 "last_chain": bytes(last).hex(), "first_sequence": int(first),
                 "last_sequence": int(end), "block_number": int(block), "block_timestamp": float(ts)}
+
+    def latest(self, collector: str, epoch: int) -> tuple[int, int]:
+        key = self.b32(collector_key(collector))
+        return (int(self.contract.functions.latestBatch(key, epoch).call()),
+                int(self.contract.functions.latestSequence(key, epoch).call()))
