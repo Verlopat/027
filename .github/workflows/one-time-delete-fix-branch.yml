@@ -1,0 +1,24 @@
+name: One-time obsolete-branch cleanup
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/one-time-delete-fix-branch.yml'
+permissions:
+  contents: write
+jobs:
+  delete-obsolete-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete fix branch only after verifying ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Verlopat/027"
+          comparison="$(gh api "repos/$GITHUB_REPOSITORY/compare/fix/v2-adversary-freshness...main" --jq '.status')"
+          if [[ "$comparison" != "ahead" && "$comparison" != "identical" ]]; then
+            echo "Refusing deletion because the fix branch is not merged into main: $comparison"
+            exit 1
+          fi
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/fix/v2-adversary-freshness"
