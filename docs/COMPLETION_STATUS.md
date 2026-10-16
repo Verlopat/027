@@ -4,7 +4,9 @@
 
 Source used: PABLA main commit `215660b13598ee8045781a2d777c240c0aa2082f`
 (as previously verified via GitHub). The source package was pushed to GitHub as commit `1f040c6952efd1644b72534a25ae6667d304caf6` on `main`.
-This newer working copy includes additional unpushed changes; refer to the checked Git commit when attributing evidence.
+Follow-up work is published on the `fix/v2-adversary-freshness` branch;
+`main` remains at the earlier baseline. Attribute results to the exact checked
+branch commit, not this original baseline.
 
 | Item | State | Evidence | Unfinished requirement |
 |---|---|---|---|
@@ -51,10 +53,10 @@ power-loss resistance or secure deletion of old cryptographic secrets.
   `coincurve` and `pycryptodome`), Foundry negative fuzz tests (not executed),
   real-environment gated journald/Tessera adapters (not run), two baseline
   *adaptations* (tests passed), and unreviewed proof/Tamarin draft files.
-- **Still blocked:** `uv lock` cannot access the package registry in this
-  environment. `scripts/refresh_lock_and_check.sh` contains the exact next
-  steps; **CI has intentionally not been switched to `--locked` without a
-  valid updated lockfile**. The Tamarin parser/solvers and Foundry toolchain
+- **Lock issue resolved on feature branch:** local package access was blocked,
+  but GitHub Actions generated a validated lockfile and the branch CI now
+  uses `uv sync --locked`. `scripts/refresh_lock_and_check.sh` remains a
+  convenience for a future dependency update. The Tamarin parser/solvers and Foundry toolchain
   were also unavailable locally. T1–T8 are not proved.
 - **Not yet demonstrated:** complete X1–X12 campaign, external baseline
   equivalence, live certified journald/Tessera runs, multi-machine replication,
