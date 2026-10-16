@@ -59,3 +59,14 @@ power-loss resistance or secure deletion of old cryptographic secrets.
 - **Not yet demonstrated:** complete X1–X12 campaign, external baseline
   equivalence, live certified journald/Tessera runs, multi-machine replication,
   reviewer sign-off, real dataset experiments, and a Q1 novel contribution.
+
+
+## Locked dependency update on fix branch
+
+A GitHub Actions job with package-registry access ran `uv lock` and
+`uv lock --check` successfully, producing the lockfile candidate for
+`fix/v2-adversary-freshness`. The downloaded `uv.lock` passed
+`uv lock --check --offline` and includes the optional Hypothesis/native
+packages. CI test and nightly workflows now use `uv sync --locked` and
+`uv run --no-sync`. This removes the earlier dependency-resolution blocker;
+other experimental and formal verification blockers remain.

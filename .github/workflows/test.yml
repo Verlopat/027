@@ -10,7 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv run --extra test pytest -q
+      - run: uv sync --locked --extra test
+      - run: uv run --no-sync pytest -q
   foundry-and-anvil:
     runs-on: ubuntu-latest
     steps:
@@ -35,15 +36,16 @@ jobs:
                 http://127.0.0.1:8545 | grep -q '0x7a69'
       - name: Live contract and E1-E7 integration
         run: |
-          uv sync --extra chain --extra test
-          uv run python scripts/deploy_contract.py
+          uv sync --locked --extra chain --extra test
+          uv run --no-sync python scripts/deploy_contract.py
           export PABLA_CONTRACT=$(python -c 'import json;print(json.load(open("contract-deployment.json"))["address"])')
-          uv run python Main.py --backend anvil --require-chain --trials 1 --events 12 --batch-size 6
-          uv run python scripts/v2_anvil_smoke.py
+          uv run --no-sync python Main.py --backend anvil --require-chain --trials 1 --events 12 --batch-size 6
+          uv run --no-sync python scripts/v2_anvil_smoke.py
   v2-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv run --extra test python -m pytest -q tests/v2
-      - run: uv run --extra test python Main.py --v2 --events 16
+      - run: uv sync --locked --extra test
+      - run: uv run --no-sync python -m pytest -q tests/v2
+      - run: uv run --no-sync python Main.py --v2 --events 16

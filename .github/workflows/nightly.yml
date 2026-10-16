@@ -12,10 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --extra test
       - name: Property tests (10,000 cases per property)
         env:
           HYPOTHESIS_PROFILE: nightly
-        run: uv run --extra test python -m pytest -q tests/v2/property --junitxml=property.xml
+        run: uv run --no-sync python -m pytest -q tests/v2/property --junitxml=property.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -27,10 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --extra test
       - name: Mutation tests
         run: |
-          uv run --extra test mutmut run 2>&1 | tee mutation.log
-          uv run --extra test mutmut results > mutation-results.txt
+          uv run --no-sync mutmut run 2>&1 | tee mutation.log
+          uv run --no-sync mutmut results > mutation-results.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
