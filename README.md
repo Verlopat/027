@@ -205,3 +205,19 @@ forensic-grade key erasure. They must not be represented as satisfying A-ERASE
 under an attacker who obtains disk images, page caches or process-memory copies.
 The pure-Python secp256k1 implementation is neither constant-time nor side-channel
 hardened. Do not deploy it for production key custody.
+
+### Signed v2 EVM integration (Foundry + Anvil)
+
+```bash
+cd contracts && forge test -vv && cd ..
+# In another terminal: anvil --chain-id 31337 --port 8545
+uv sync --extra chain --extra test
+uv run python scripts/v2_anvil_smoke.py
+```
+
+This separate integration deploys `AnchorLogV2` to **Anvil**, anchors two
+secp256k1-signed checkpoints, submits a valid same-period equivocation proof,
+checks revocation, and records actual transaction gas from receipts under
+`output/v2-anvil-smoke.json`. It is distinct from the in-memory research smoke.
+The GitHub Foundry/Anvil CI job exercises it; public-network deployment and
+full cost/performance evaluation remain outside the smoke test.

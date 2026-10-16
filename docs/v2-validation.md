@@ -6,8 +6,13 @@ trusted-policy verification; scheduling DP compared against a brute-force
 oracle), v2 smoke execution on a labeled in-memory ledger, and X3 constrained
 adaptive attack probes. The runner stores elapsed nanoseconds from actual code.
 
-**Not executed here:** Solidity compilation/Foundry fuzz/invariants, signed EVM
-checkpoint deployment, EVM gas comparison, LANL/Loghub ingestion, 30-run
+**CI test configured (check GitHub's actual conclusion):** Solidity compilation,
+Foundry vector tests, legacy Anvil integration and an opt-in signed v2 Anvil
+smoke that records real local-EVM receipts. This is a single smoke, not the
+full gas comparison or multi-reset trial matrix.
+
+**Not executed in this local environment:** full Foundry fuzz/invariants, complete
+EVM gas comparisons, LANL/Loghub ingestion, 30-run
 full-profile campaign, two-machine replication, Rust key custody, native
 journald FSS and Tessera baselines, independent computational or Tamarin
 proof checks, and a second-reader full-text novelty review. Their absence is

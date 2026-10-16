@@ -39,6 +39,7 @@ jobs:
           uv run python scripts/deploy_contract.py
           export PABLA_CONTRACT=$(python -c 'import json;print(json.load(open("contract-deployment.json"))["address"])')
           uv run python Main.py --backend anvil --require-chain --trials 1 --events 12 --batch-size 6
+          uv run python scripts/v2_anvil_smoke.py
   v2-smoke:
     runs-on: ubuntu-latest
     steps:
