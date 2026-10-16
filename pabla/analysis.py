@@ -141,7 +141,7 @@ def figures(run: Path, summary: dict) -> list[str]:
         plt.close(fig)
     fi=summary.get('fi_attack_matrix',[])
     attack='REWRITE_PREVIOUS_SIGNED_PENDING_PERIOD'
-    selected=[r for r in fi if r.get('attack')==attack]
+    selected=[r for r in fi if r.get('attack')==attack and r.get('attacker_model')=='stolen-current-key']
     if selected:
         groups=defaultdict(list)
         for r in selected:groups[r['method']].append(int(r['accepted']))

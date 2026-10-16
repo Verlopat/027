@@ -611,6 +611,13 @@ def fi_compromise(options: Options) -> list[dict]:
             b2=c.collect(stream[n:2*n])  # signed, pending, NOT YET anchored
             current_seed=evolving.compromised_current_seed_for_test() if evolving else None
             prior_seed=(evolving.historical_seeds.get(2) if method=='FI-noerase' else None) if evolving else None
+            naive=copy.deepcopy(b2)
+            naive.events[0]['payload']['pid']+=351
+            nv=verify_pending_batch(naive,ledger,policy=policy,previous=b1.manifest)
+            rows.append(_row('E9',method,trial,ledger,
+                attack='REWRITE_PREVIOUS_SIGNED_PENDING_PERIOD',
+                attacker_model='naive-archive-mutation',accepted=int(nv.status=='ACCEPT_WITH_WARNING'),
+                verdict=nv.status,anomalies=';'.join(nv.anomalies),period=2))
             forged=copy.deepcopy(b2)
             forged.events[0]['payload']['pid']+=351
             forged=rebuild_untrusted(forged,policy)
@@ -653,6 +660,70 @@ def fi_compromise(options: Options) -> list[dict]:
                     attacker_model='adaptive-stolen-key',accepted=int(v3.status=='ACCEPT'),
                     verdict=v3.status,anomalies=';'.join(v3.anomalies),period=3,
                     ground_truth='semantically fabricated, cryptographically valid'))
+            # Anchored-history attack set: every construction with a trustworthy
+            # immutable anchor must reject deletion, splice and reordering.
+            # This is NOT presented as an FI-only advantage.
+            if not policy.forward_integrity:
+                ledger.anchor(b2)
+                b3=c.collect(stream[2*n:]);ledger.anchor(b3)
+            # Explicit back-fill submission after the on-chain period has advanced.
+            try:
+                ledger.anchor(b2)
+                backfill_rejected=False
+            except ProtocolError:
+                backfill_rejected=True
+            rows.append(_row('E9',method,trial,ledger,attack='BACKFILL_OLD_PERIOD',
+                attacker_model='adaptive-stolen-key',accepted=int(not backfill_rejected),
+                verdict='REJECT_SUBMISSION' if backfill_rejected else 'ACCEPT_SUBMISSION'))
+            history=[b1,b2,b3]
+            for attack_name in ('TRUNCATE_ANCHORED_HISTORY','SPLICE_ANCHORED_BATCHES','REORDER_ANCHORED_BATCHES'):
+                edited=copy.deepcopy(history)
+                if attack_name=='TRUNCATE_ANCHORED_HISTORY':
+                    edited.pop()
+                elif attack_name=='SPLICE_ANCHORED_BATCHES':
+                    edited[1].events[-1],edited[2].events[0]=edited[2].events[0],edited[1].events[-1]
+                    edited[1]=rebuild_untrusted(edited[1],policy)
+                    edited[2]=rebuild_untrusted(edited[2],policy)
+                    if not policy.forward_integrity:
+                        for changed in edited[1:]: changed.signature=sign(sk,changed.manifest_digest)
+                else:
+                    edited[1],edited[2]=edited[2],edited[1]
+                verdicts=verify_complete_history(edited,ledger,policy=policy,
+                    collector_id=collector_id,epoch=1)
+                bad=next((v for v in verdicts if v.status.startswith('REJECT_')),verdicts[-1])
+                rows.append(_row('E9',method,trial,ledger,attack=attack_name,
+                    attacker_model='adaptive-stolen-key',accepted=int(not any(
+                        v.status.startswith('REJECT_') for v in verdicts)),verdict=bad.status,
+                    anomalies=';'.join(bad.anomalies),trust_model='immutable ledger head'))
+            # The stolen current key can equivocate within the pending window.
+            # Both archives pass independently, but at most one can be anchored.
+            upcoming=[]
+            stolen=evolving.compromised_current_seed_for_test() if evolving else None
+            for variant in (0,1):
+                if policy.forward_integrity:
+                    clone_signer=EvolvingSigner(bytearray(stolen),evolving.start_period,
+                        evolving.count,evolving.current_period,evolving.public_keys,
+                        evolving.leaves,evolving.root)
+                    clone=Collector(collector_id,1,sk,policy,
+                        next_sequence=c.next_sequence,next_batch=c.next_batch,
+                        last_chain=c.last_chain,last_manifest=c.last_manifest,
+                        evolving=clone_signer)
+                else:
+                    clone=Collector(collector_id,1,sk,policy,
+                        next_sequence=c.next_sequence,next_batch=c.next_batch,
+                        last_chain=c.last_chain,last_manifest=c.last_manifest)
+                future=generate_events(n,options.seed+trial+variant+200,collector_id,1,
+                    timestamp=options.base_timestamp or utc_now())
+                for idx,ev in enumerate(future):
+                    ev['collector_monotonic_ns']=3*n+idx+1
+                    ev['payload']['pid']+=variant
+                upcoming.append(clone.collect(future))
+            equivocal=[verify_pending_batch(x,ledger,policy=policy,previous=b3.manifest) for x in upcoming]
+            rows.append(_row('E9',method,trial,ledger,attack='EQUIVOCATE_PENDING_WINDOW',
+                attacker_model='adaptive-current-key',accepted=int(all(
+                    v.status=='ACCEPT_WITH_WARNING' for v in equivocal)),
+                verdict='ACCEPT_BOTH_PENDING' if all(v.status=='ACCEPT_WITH_WARNING' for v in equivocal) else 'REJECT',
+                period=c.next_batch,ground_truth='two mutually inconsistent authenticated pending histories'))
         # CT-style unanchored checkpoints: a compromised STATIC key can sign a
         # new checkpoint for rewritten logs. Anchored roots reject the rewrite.
         for anchored in (False,True):

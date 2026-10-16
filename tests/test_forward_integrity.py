@@ -120,9 +120,11 @@ def test_keychain_reference_missing_transition():
 def test_e9_measured_differential():
     rows=fi_compromise(Options(trials=1,event_count=12,batch_size=4))
     attack='REWRITE_PREVIOUS_SIGNED_PENDING_PERIOD'
-    result={r['method']:r['accepted'] for r in rows if r.get('attack')==attack}
+    result={r['method']:r['accepted'] for r in rows if r.get('attack')==attack and r.get('attacker_model')=='stolen-current-key'}
     assert result['FI']==0 and result['FI-noerase']==1 and result['P1']==1 and result['B4']==1
     assert all(r['accepted']==0 for r in rows if r.get('attack')=='REWRITE_ALREADY_ANCHORED')
+    assert all(r['accepted']==0 for r in rows if r.get('attack') in ('BACKFILL_OLD_PERIOD','TRUNCATE_ANCHORED_HISTORY','SPLICE_ANCHORED_BATCHES','REORDER_ANCHORED_BATCHES'))
+    assert all(r['accepted']==1 for r in rows if r.get('attack')=='EQUIVOCATE_PENDING_WINDOW')
 
 
 def test_randomized_exposure_count_10000_cases():
