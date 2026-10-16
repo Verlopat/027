@@ -28,3 +28,17 @@ old-secret erasure from process memory, swapped pages, write-ahead remnants or
 flash-storage wear leveling. These remain open security requirements.
 
 Run: `python -m pytest -q tests/v2/crash/test_fault_injection.py`.
+
+
+## Multi-period injection campaign (2026-10-16)
+
+A second regression suite exercises append(5) → seal(100) → append(3) →
+seal(200) → empty heartbeat seal(300) → append(2) → seal(400), with
+fault injection at all **256** observed SQLite execution boundaries. For each
+fault index, restart is checked against acknowledged events, the four
+canonical period checkpoints, the real full verifier and witness consistency
+proof checks. The 256 cases were executed in three shards (1–80, 81–160,
+161–256), all passing in this environment. This remains deterministic
+exception/fault injection, not SIGKILL, power-loss or key-erasure validation.
+The `PABLA_CRASH_START` and `PABLA_CRASH_END` environment variables enable
+CI to run disjoint shards without hiding faults.

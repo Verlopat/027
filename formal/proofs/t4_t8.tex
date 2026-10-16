@@ -1,0 +1,20 @@
+% DRAFT for independent security review
+\section*{T4 -- First-divergence same-period argument}
+Take two non-prefix-consistent, contiguous signed checkpoint histories of
+the same collector and epoch with the same authenticated genesis. At their
+first differing index $p$, they have distinct checkpoint digests for period
+$p$, unless a digest collision occurs. If both are accepted under one
+schedule, there are two signatures authorizing the distinct digests with the
+schedule's period-$p$ key. Therefore the pair is candidate fraud evidence.
+\todo{Establish how a complainant obtains both branches. Without eventual
+cross-view gossip/delivery, existence of two accepted forks does NOT imply
+publicly available evidence or timely revocation.}
+
+\section*{T8 -- Soundness of publicly verified equivocation evidence}
+Two valid low-$s$ secp256k1 signatures on distinct digests, tied by a single
+schedule leaf and period index, cannot be emitted by an honest collector that
+signs at most one digest per period, absent a signature forgery or crash
+non-equivocation failure. The on-chain verifier must reject a high-$s$
+signature and mismatched collector, period, epoch, or schedule root.
+\todo{Give a precise EUF-CMA reduction, including ECDSA signer recovery and
+malleability treatment; depend explicitly on T7 and review Solidity.}

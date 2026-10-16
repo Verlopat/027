@@ -1,0 +1,64 @@
+/* PABLA-v2 symbolic model -- RESEARCH DRAFT, NOT VERIFIED WITH TAMARIN.
+ * This first abstraction omits wall-clock time, Merkle trees, ECDSA specifics,
+ * crash persistence, witness authentication and schedule renewal. Its lemmas
+ * are candidate obligations only, NOT proven guarantees.
+ */
+theory PABLA_v2_Draft
+begin
+builtins: signing
+functions: evolve/1, derive/1, successor/1, checkpoint/3
+
+/* Single active collector state, forward-only update. The erasure assumption
+ * is represented by consuming State; realistic memory remanence is omitted. */
+rule Register:
+ [ Fr(~state), Fr(~collector) ]
+ --[ Register(~collector) ]->
+ [ State(~collector,'first',~state), !Collector(~collector) ]
+
+rule Seal_And_Advance:
+ [ State(c,p,s), Fr(~payload) ]
+ --[ HonestSeal(c,p,~payload), PeriodKey(c,p,pk(derive(s))) ]->
+ [ State(c,successor(p),evolve(s)),
+   !Signed(c,p,~payload),
+   !RegisteredKey(c,p,pk(derive(s))),
+   Out(<c,p,~payload,sign(checkpoint(c,p,~payload),derive(s))>) ]
+
+/* Compromising at period p reveals current state, from which all later
+ * states can be computed but an earlier state cannot (symbolic abstraction). */
+rule Compromise_Current_State:
+ [ State(c,p,s) ]
+ --[ Compromise(c,p) ]->
+ [ State(c,p,s), Out(s) ]
+
+/* A witness verifies against a schedule-registered public key.
+ * A symbolic witness stores at most one accepted checkpoint per period.
+ * The rules below do not yet model multiple witnesses or consistency proofs.
+ */
+rule Witness_First_Receipt:
+ [ !RegisteredKey(c,p,pk(k)), In(<c,p,m,sign(checkpoint(c,p,m),k)>) ]
+ --[ WitnessReceipt(c,p,m) ]->
+ [ !WitnessStored(c,p,m) ]
+
+rule Ledger_Receipt:
+ [ !RegisteredKey(c,p,pk(k)), In(<c,p,m,sign(checkpoint(c,p,m),k)>) ]
+ --[ LedgerReceipt(c,p,m) ]->
+ [ !LedgerAnchored(c,p,m) ]
+
+/* The appearance of two different signed period values is evidence only if
+ * both signed records can be submitted to the adjudicator. */
+rule Publish_Fork_Evidence:
+ [ !RegisteredKey(c,p,pk(k)),
+   In(<c,p,m1,sign(checkpoint(c,p,m1),k)>),
+   In(<c,p,m2,sign(checkpoint(c,p,m2),k)>) ]
+ --[ ForkPresented(c,p,m1,m2) ]->
+ [ !FraudCandidate(c,p,m1,m2) ]
+
+/* Sanity trace: seal is reachable; not a security theorem. */
+lemma sane_honest_seal: exists-trace
+ "Ex c p m #i. HonestSeal(c,p,m) @ i"
+
+/* Pending research properties, not claimed here: old-period unforgeability;
+ * accepted fork -> available evidence (requires gossip/liveness assumptions);
+ * honest-only never falsely revoked; replay gap/freshness. Each needs careful
+ * formalisation rather than a tautological acceptance rule. */
+end

@@ -1,0 +1,25 @@
+% DRAFT for outside cryptographic review
+\section*{T1 -- External prefix binding (conditional sketch)}
+Suppose an adversary supplies two different event prefixes of the same
+sequence length that both verify against an identical externally committed
+RFC-6962-style root. Distinguish the earliest differing leaf or internal node
+in the induced trees: equal parent hashes with distinct children give a
+collision in the tree's domain-separated hash, unless the two input encodings
+collide. This is a standard Merkle-binding reduction. Authenticated root
+origin is an independent assumption: a witness signature or finalized ledger
+receipt must be verified before invoking the reduction.
+\todo{Write the full extraction algorithm, handle different prefix sizes and
+consistency proofs, and quantify domain-separation and encoding assumptions.}
+
+\section*{T2 -- Previous-period forward integrity (conditional sketch)}
+At time $t^*$ the adversary receives current state $s_p$. All earlier
+states $s_i$ for $i<p$ are assumed erased. Replace the evolution/derivation
+PRG outputs up to the challenged prior period by independent random keys
+using a hybrid sequence. An accepted new prior-period checkpoint whose
+period public key was registered implies an EUF-CMA period signature forgery,
+unless a schedule proof or event commitment is broken. A reduction guessing
+one of $N$ periods can lose a factor of $N$, plus the sum of PRG distinguisher
+advantages.
+\todo{Make the reduction non-circular when the attacker has already observed
+all honest signatures, and state the security bound with exact $N$ and query
+factors. CPython/SQLite do not satisfy secure erasure; this is conditional.}

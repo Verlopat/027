@@ -1,0 +1,25 @@
+% DRAFT -- not a proved bound
+\section*{T3 -- Conditional upper bounds on suppression}
+With a trusted current clock and mandatory heartbeats, deleting the last
+sealed period causes a stale-tip verdict. An internal deletion of a sealed
+period creates a period gap or breaks checkpoint links. Changing sealed bytes
+while preserving period identity requires a signature or Merkle forgery
+(T1--T2). If a later cosigned or anchored checkpoint covers the removed
+records, the independent holder has evidence of their prior existence.
+
+\textbf{Counterexample without freshness:} Removing a final sealed
+checkpoint together with all its events leaves a signature-valid prefix;
+this may be accepted without a time policy or an external tip. Therefore the
+$W_{\mathrm{silent}}$ upper bound is false in that weaker model.
+\todo{Prove exact time-boundary inequalities with clock skew, delivery-delay
+ceilings and witness omission, rather than just attack-catalogue outcomes.}
+
+\section*{T5 -- Lower bounds (open)}
+A collector that has not emitted a message depending on an event has no
+externally witnessed evidence of that event. An attacker that sees the
+unsealed mutable state can attempt to simulate the collector on a trace
+where the event never arrived. The distributions are not necessarily
+identical if input acknowledgments or third-party telemetry leak event
+existence.
+\todo{State the permitted side channels and evidence interface, then prove
+an indistinguishability lower bound; an unqualified lower bound is unjustified.}

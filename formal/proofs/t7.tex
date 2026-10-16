@@ -1,0 +1,21 @@
+% DRAFT -- under idealized SQLite durability
+\section*{T7 -- Crash non-equivocation}
+State consists of the persisted event rows, monotone period number, current
+period seed, previous digest, optional durable seal intent and archived
+signed checkpoints. Seal protocol: atomically write intent before signing;
+atomically commit the signed checkpoint and next key/state and erase the
+intent; emit to external parties only after the durable commit. After a
+crash, recovery either reconstructs a signature for the identical intent,
+or re-emits the existing signed checkpoint. Deterministic RFC-6979 ECDSA
+ensures a re-sign of an identical intent yields the same bytes; as an
+alternative, a persisted signature eliminates reliance on determinism.
+
+A per-transaction invariant is: at most one durable `(period,digest)` exists;
+period advances only when that checkpoint is durable. A local regression
+checks 256 injected SQLite boundaries spanning four seals, one of which is
+an empty heartbeat. This establishes neither power-loss immunity nor
+secure key deletion: WAL journal remanence and fsync-dishonest hardware are
+outside the observed experiment.
+\todo{Formalize a persistence/crash transition system and show that all
+possible filesystem outcomes satisfy the invariant, not just instrumented
+SQL exceptions.}

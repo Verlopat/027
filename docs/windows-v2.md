@@ -22,3 +22,19 @@ matching theoretical lower bounds are unproven.
 `output/v2testN/x03_windows.csv` includes sampled times, measured attack
 verdicts, and distinct analytic predictions; the report retains any violations.
 The run deliberately does not calculate p-values over deterministic outcomes.
+
+## Freshness is a necessary trust assumption for silent-suppression bounds
+
+A verifier with only a historical archive cannot distinguish the legitimately
+terminated log from a suffix whose final sealed periods and associated events
+were deleted. In particular, removing the last sealed checkpoint **together
+with all events unique to it** may leave a gap-free, signature-valid prefix.
+Thus W_silent bounds are conditional on a trusted current clock, seal interval,
+clock tolerance, and a heartbeat/freshness check. Without this policy the
+`DROP_LAST_SEALED_PERIOD` attack can be accepted even when all removed events
+were sealed with erased keys. It is not evidence of a broken signature or ratchet.
+
+`adversary.maximize()` requires trusted `now_ms`/`seal_interval_ms` in the
+normal mode. `allow_no_freshness=True` is an explicitly named *insecure
+ablation* used to demonstrate the necessity of freshness, never a default
+experiment configuration. Both scenarios run through the actual verifier.

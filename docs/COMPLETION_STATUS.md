@@ -3,8 +3,8 @@
 **This is an implementation/validation record, not a research manuscript or a Q1 acceptance claim.**
 
 Source used: PABLA main commit `215660b13598ee8045781a2d777c240c0aa2082f`
-(as previously verified via GitHub). This working copy is not connected to a
-Git repository and has **not** been pushed to GitHub.
+(as previously verified via GitHub). The source package was pushed to GitHub as commit `1f040c6952efd1644b72534a25ae6667d304caf6` on `main`.
+This newer working copy includes additional unpushed changes; refer to the checked Git commit when attributing evidence.
 
 | Item | State | Evidence | Unfinished requirement |
 |---|---|---|---|
@@ -38,3 +38,24 @@ restart. Replaced this with explicit `BEGIN IMMEDIATE` and `COMMIT`, with
 `ROLLBACK` on failure. The enumerated test now passes for every instrumented
 SQLite execution/transaction boundary. This does **not** establish physical
 power-loss resistance or secure deletion of old cryptographic secrets.
+
+## Follow-up after independent audit of commit `1f040c6`
+
+- **Fixed locally:** the bounded adversary now requires a trusted freshness
+  policy by default and offers an explicit no-freshness ablation. Dropping
+  a final sealed period and its events can succeed without freshness;
+  `tests/v2/test_adversary.py` proves both outcomes with the real verifier.
+- **Multi-seal crash validation:** all 256 instrumented boundaries passed in
+  three shards; this is not physical power-loss or SIGKILL validation.
+- **Added:** 300-vector native differential test (runs only with optional
+  `coincurve` and `pycryptodome`), Foundry negative fuzz tests (not executed),
+  real-environment gated journald/Tessera adapters (not run), two baseline
+  *adaptations* (tests passed), and unreviewed proof/Tamarin draft files.
+- **Still blocked:** `uv lock` cannot access the package registry in this
+  environment. `scripts/refresh_lock_and_check.sh` contains the exact next
+  steps; **CI has intentionally not been switched to `--locked` without a
+  valid updated lockfile**. The Tamarin parser/solvers and Foundry toolchain
+  were also unavailable locally. T1–T8 are not proved.
+- **Not yet demonstrated:** complete X1–X12 campaign, external baseline
+  equivalence, live certified journald/Tessera runs, multi-machine replication,
+  reviewer sign-off, real dataset experiments, and a Q1 novel contribution.

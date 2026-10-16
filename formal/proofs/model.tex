@@ -1,0 +1,26 @@
+% WORKING DRAFT - no independent proof review or security claim.
+\section*{PABLA-v2 formal model (unreviewed draft)}
+\newcommand{\todo}[1]{\par\textbf{OPEN PROOF GAP:} #1\par}
+Let $\mathcal{C}$ be a collector with period indices $p\in\mathbb{N}$,
+append-only externally committed checkpoints, and a forward-ratcheted
+current state $s_p$. $\mathcal{A}$ is an adaptive PPT attacker that at time
+$t^*$ learns the entire current collector state and archive. It may rewrite
+or suppress unexternally committed output, but cannot alter final ledger
+receipts or an honest witness's durable checkpoints. ``Accept'' means the
+actual full verifier has checked a trusted policy including a bounded
+heartbeat interval and wall-clock freshness; without that condition the
+suffix-truncation counterexample is immediate.
+
+For each event $e$, let $a_e,\sigma_e,\omega_e,\kappa_e$ denote its
+arrival, seal, honest witness, and finalized ledger confirmation times;
+$\xi_e=\min(\omega_e,\kappa_e)$. Window assertions are predicates over
+accepted challenge histories, not mere arithmetic equalities.
+
+Assumptions: collision resistance of the binding tree; forward secrecy of
+separately domain-separated PRG evolution and period-secret extraction;
+EUF-CMA authentication of period keys; irrevocable key erasure; an honest
+witness if witnesses are used; ledger immutability and stated liveness;
+serializable WAL commits and crash-idempotent signing.
+
+\todo{Define a single game interface for full and light verifier outputs and
+external freshness evidence, including negligible-probability accounting.}

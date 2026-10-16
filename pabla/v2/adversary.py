@@ -21,6 +21,10 @@ class CompromiseView:
     epoch:int
     stolen_seed:bytes
     anchors:dict[int,bytes]
+    # Trusted wall-clock policy, not taken from the attacker-supplied checkpoints.
+    now_ms:int|None=None
+    seal_interval_ms:int|None=None
+    clock_slack_ms:int=0
 
 @dataclass(frozen=True)
 class Candidate:
@@ -49,6 +53,36 @@ def strategies(view:CompromiseView)->list[Candidate]:
     rows=[Candidate('HONEST',events,seals)]
     if not seals:return rows
     rows.append(Candidate('TRUNCATE_TAIL',events,seals[:-1]))
+    # Suppress each possible sealed suffix together with the events committed
+    # exclusively by that suffix. Unlike TRUNCATE_TAIL, these archives can
+    # pass signature/root verification if freshness and external commitments
+    # are not enforced. Retain genesis; removing it yields an empty history.
+    for retained in range(1,len(seals)):
+        prefix_end=seals[retained-1].checkpoint.size
+        rows.append(Candidate('DROP_LAST_SEALED_PERIOD',
+                              events[:prefix_end],seals[:retained]))
+    # A key thief may emit a *later* heartbeat after removing a sealed period.
+    # This is not an ordinary contiguous continuation: the verifier must catch
+    # the missing period even if the thief possesses the later period's key.
+    if len(seals)>1:
+        from .tree import CompactRange
+        from .checkpoint import Checkpoint
+        from .crypto import sign_digest,secret_for_state
+        prefix_end=seals[-2].checkpoint.size
+        retained=seals[:-1]
+        next_period=seals[-1].checkpoint.period+1
+        if next_period<view.schedule.first+len(view.schedule.addresses):
+            tree=CompactRange()
+            for e in events[:prefix_end]:tree.append(e)
+            last=seals[-1].checkpoint
+            heartbeat=Checkpoint(last.collector,last.epoch,next_period,
+                                 prefix_end,tree.root(),retained[-1].checkpoint.digest(),
+                                 max(last.wall_ms,view.now_ms or last.wall_ms),last.schedule_root)
+            fabricated=Sealed(heartbeat,sign_digest(secret_for_state(view.stolen_seed),
+                                                    heartbeat.digest()),
+                              tuple(view.schedule.proof(next_period)))
+            rows.append(Candidate('DROP_PERIOD_THEN_HEARTBEAT',events[:prefix_end],
+                                  retained+(fabricated,)))
     rows.append(Candidate('DELETE_LAST_EVENT',events[:-1],seals))
     rows.append(Candidate('DELETE_ALL_EVENTS',(),seals))
     rows.append(Candidate('REPLAY_LAST_SEAL',events,seals+(seals[-1],)))
@@ -78,20 +112,27 @@ def strategies(view:CompromiseView)->list[Candidate]:
     return rows
 
 
-def maximize(view:CompromiseView,objective:str='silent')->SearchResult:
+def maximize(view:CompromiseView,objective:str='silent',*,allow_no_freshness:bool=False)->SearchResult:
     if objective not in ('silent','modify'):
         raise ValueError('supported objectives: silent, modify')
+    # A freshness-free verifier cannot support a silent-suppression bound.
+    # Only an explicitly requested ablation may omit the trusted time policy.
+    if not allow_no_freshness and (view.now_ms is None or view.seal_interval_ms is None):
+        raise ValueError('trusted now_ms and seal_interval_ms required; use allow_no_freshness=True only for ablation')
+    time_kwargs={} if allow_no_freshness else {
+        'now_ms':view.now_ms,'seal_interval_ms':view.seal_interval_ms,
+        'clock_slack_ms':view.clock_slack_ms}
     best=None;attempts=strategies(view)
     for candidate in attempts:
         if candidate.name=='HONEST':continue
         verdict=verify_full(list(candidate.events),list(candidate.seals),view.schedule,
-                            collector=view.collector,epoch=view.epoch,anchors=view.anchors)
+                            collector=view.collector,epoch=view.epoch,anchors=view.anchors,**time_kwargs)
         missing,changed=_difference(view.events,candidate.events)
         value=missing if objective=='silent' else changed
         if verdict.accepted() and value>0 and (best is None or value>best[1]):
             best=(candidate.name,value,missing,changed,verdict)
     if best is None:
         honest=verify_full(list(view.events),list(view.seals),view.schedule,
-                           collector=view.collector,epoch=view.epoch,anchors=view.anchors)
+                           collector=view.collector,epoch=view.epoch,anchors=view.anchors,**time_kwargs)
         return SearchResult('NONE',0,0,honest,len(attempts)-1)
     return SearchResult(best[0],best[2],best[3],best[4],len(attempts)-1)

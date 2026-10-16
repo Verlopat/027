@@ -1,0 +1,16 @@
+% DRAFT -- mathematical validation required
+\section*{T6 -- Offline deadline-constrained scheduling}
+For prices $\pi_t\ge0$ and deadline $D$, let an allowed anchor schedule
+have no gap of more than $D$ slots, including the start and end horizon
+conditions. A dynamic program whose state stores the last anchor time
+is exact: the optimal prefix ending with an anchor at $t$ equals
+$g\pi_t+\min_{t-D\le j<t}\mathrm{DP}[j]$ with the appropriate start
+boundary. The minimum over valid final states gives the optimum. A monotone
+minimum deque reduces evaluation to $O(T)$ time when transitions have this
+sliding-window structure. Enumeration for bounded $T$ is an independent
+executable oracle in `pabla/v2/scheduling.py`.
+\todo{Check initial and final boundary conditions against `valid_schedule`,
+prove that negative prices are excluded, and provide a complete induction.}
+\paragraph{T6$'$ online policy.} The claimed $O(\sqrt{M/m})$ competitive
+ratio is a \emph{conjecture}, not a theorem; it is unsafe to borrow the
+single-purchase one-way-trading result without treating interacting anchors.
